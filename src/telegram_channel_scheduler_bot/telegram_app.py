@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from .balancer import PHOTO, VIDEO, choose_media_type
 from .config import AppConfig
-from .health import start_http_server_from_env
+from .health import PUBLIC_URL_SETTING, normalize_public_base_url, start_http_server_from_env
 from .posting_plan import (
     QUEUE_ALERT_HOURS,
     QueueCoverage,
@@ -39,6 +39,16 @@ from .storage import AddMediaResult, MediaItem, Store
 LOGGER = logging.getLogger(__name__)
 PUBLISH_JOB_NAME = "publisher"
 MAX_POSTS_PER_RUN = 20
+PUBLIC_URL_ENV_KEYS = (
+    "PUBLIC_BASE_URL",
+    "APP_URL",
+    "APP_DOMAIN",
+    "SERVICE_URL",
+    "TRANGER_PUBLIC_URL",
+    "TRANGER_APP_URL",
+    "RENDER_EXTERNAL_URL",
+    "RAILWAY_PUBLIC_DOMAIN",
+)
 
 
 @dataclass(frozen=True)
@@ -299,6 +309,7 @@ def build_help_text() -> str:
         "Mandami foto o video in chat privata: li metto in coda e li pubblico sul canale.\n\n"
         "Comandi:\n"
         "/whoami - mostra il tuo ID Telegram\n"
+        "/web_url - mostra l'URL pubblico per shortcut/API, se rilevabile\n"
         "/status - mostra configurazione e coda\n"
         "/queue - mostra i prossimi elementi in coda\n"
         "/set_channel @canale - imposta il canale di destinazione\n"
@@ -326,6 +337,59 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user is None:
         return
     await update.effective_message.reply_text(f"Il tuo ID Telegram e: {user.id}")
+
+
+def configured_public_base_urls(store: Store) -> list[tuple[str, str]]:
+    urls: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    env_url = normalize_public_base_url(os.getenv("QUEUE_PUBLIC_BASE_URL", ""))
+    if env_url:
+        urls.append(("QUEUE_PUBLIC_BASE_URL", env_url))
+        seen.add(env_url)
+
+    for key in PUBLIC_URL_ENV_KEYS:
+        env_url = normalize_public_base_url(os.getenv(key, ""))
+        if env_url and env_url not in seen:
+            urls.append((key, env_url))
+            seen.add(env_url)
+
+    remembered_url = normalize_public_base_url(store.get_setting(PUBLIC_URL_SETTING, "") or "")
+    if remembered_url and remembered_url not in seen:
+        urls.append(("rilevato dagli header HTTP", remembered_url))
+
+    return urls
+
+
+async def web_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    urls = configured_public_base_urls(store)
+    if not urls:
+        await update.effective_message.reply_text(
+            "Non riesco ancora a vedere l'URL pubblico.\n\n"
+            "Prova cosi:\n"
+            "1. Apri da browser l'URL Tranger che trovi nel pannello, aggiungendo /healthz.\n"
+            "2. Se vedi ok, torna qui e manda di nuovo /web_url.\n\n"
+            "Se Tranger permette env custom, puoi anche aggiungere:\n"
+            "QUEUE_PUBLIC_BASE_URL=https://tuo-dominio"
+        )
+        return
+
+    lines = ["URL pubblico rilevato:"]
+    for source, url in urls:
+        lines.extend(
+            [
+                f"- {url}",
+                f"  sorgente: {source}",
+                f"  health: {url}/healthz",
+                f"  foto: {url}/api/queue/photo",
+                f"  video: {url}/api/queue/video",
+            ]
+        )
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -947,6 +1011,7 @@ def build_application(config: AppConfig) -> Application:
     application.bot_data["store"] = store
 
     application.add_handler(CommandHandler("whoami", whoami_command))
+    application.add_handler(CommandHandler(["web_url", "url"], web_url_command))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))

@@ -16,6 +16,57 @@ from .storage import Store
 
 
 LOGGER = logging.getLogger(__name__)
+PUBLIC_URL_SETTING = "last_public_base_url"
+
+
+def _clean_forwarded_value(value: str | None) -> str:
+    return (value or "").split(",", 1)[0].strip()
+
+
+def _is_private_host(host: str) -> bool:
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
+    return (
+        not host
+        or host == "localhost"
+        or host.startswith("127.")
+        or host.startswith("10.")
+        or host.startswith("192.168.")
+        or host.endswith(".local")
+    )
+
+
+def normalize_public_base_url(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
+    return value.rstrip("/")
+
+
+def infer_public_base_url(headers: Any) -> str | None:
+    forwarded_host = _clean_forwarded_value(headers.get("X-Forwarded-Host"))
+    host = forwarded_host or _clean_forwarded_value(headers.get("Host"))
+    if _is_private_host(host):
+        return None
+
+    forwarded_proto = _clean_forwarded_value(headers.get("X-Forwarded-Proto"))
+    proto = forwarded_proto if forwarded_proto in {"http", "https"} else "https"
+    return normalize_public_base_url(f"{proto}://{host}")
+
+
+def remember_public_base_url(store: Store | None, headers: Any) -> None:
+    if store is None:
+        return
+
+    base_url = infer_public_base_url(headers)
+    if not base_url:
+        return
+
+    try:
+        store.set_setting(PUBLIC_URL_SETTING, base_url)
+    except Exception:
+        LOGGER.exception("Failed to remember public base URL")
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -111,6 +162,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     bot_token: str | None = None
 
     def do_GET(self) -> None:
+        remember_public_base_url(self.store, self.headers)
         if self.path not in {"/", "/healthz"}:
             self.send_response(404)
             self.end_headers()
@@ -124,6 +176,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
+        remember_public_base_url(self.store, self.headers)
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path not in {"/api/queue/photo", "/api/queue/video"}:
             _json_response(self, 404, {"ok": False, "error": "not_found"})

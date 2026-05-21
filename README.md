@@ -100,6 +100,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 ## Comandi
 
 - `/start` o `/help`: guida rapida.
+- `/web_url`: mostra l'URL pubblico per Apple Shortcuts/API, se il bot riesce a rilevarlo.
 - `/status`: configurazione, coda e conteggi.
 - `/queue`: primi elementi in coda.
 - `/set_channel @canale`: imposta il canale.
