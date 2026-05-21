@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
 import math
+from pathlib import Path
 import re
 
 from telegram import Message, Update
@@ -30,6 +31,7 @@ from .posting_plan import (
     initial_next_publish_at,
     seconds_until_next_publish,
 )
+from .state_archive import create_state_backup, restore_state_backup
 from .storage import AddMediaResult, MediaItem, Store
 
 
@@ -307,6 +309,8 @@ def build_help_text() -> str:
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
         f"Alert coda: ti avviso se non copre le prossime {QUEUE_ALERT_HOURS} ore\n"
+        "/backup_state - ricevi un backup zip di coda e impostazioni\n"
+        "/restore_state CONFIRM - ripristina rispondendo a un backup zip\n"
         "/pause - pausa la pubblicazione automatica\n"
         "/resume - riattiva la pubblicazione automatica\n"
         "/remove ID - rimuove un elemento dalla coda\n"
@@ -557,6 +561,74 @@ async def mark_published_command(update: Update, context: ContextTypes.DEFAULT_T
         if is_new
         else "Era gia segnato come pubblicato."
     )
+
+
+async def backup_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    await update.effective_message.reply_text("Creo backup dello stato del bot...")
+    try:
+        archive_path = create_state_backup(store.path, Path("./state_backups"))
+    except Exception as exc:
+        LOGGER.exception("State backup failed")
+        await update.effective_message.reply_text(f"Backup fallito: {exc}")
+        return
+
+    with archive_path.open("rb") as backup_file:
+        await update.effective_message.reply_document(
+            document=backup_file,
+            filename=archive_path.name,
+            caption=(
+                "Backup stato Queue Bot. Conserva questo file: contiene coda, "
+                "impostazioni, deduplica e prossimo orario di pubblicazione."
+            ),
+        )
+
+
+async def restore_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    if not context.args or context.args[0] != "CONFIRM":
+        await update.effective_message.reply_text(
+            "Per ripristinare lo stato, rispondi al file backup .zip con:\n"
+            "/restore_state CONFIRM\n\n"
+            "Attenzione: sostituisce coda e impostazioni attuali."
+        )
+        return
+
+    replied = update.effective_message.reply_to_message
+    if not replied or not replied.document:
+        await update.effective_message.reply_text("Rispondi a un file backup .zip con /restore_state CONFIRM.")
+        return
+
+    if not replied.document.file_name or not replied.document.file_name.endswith(".zip"):
+        await update.effective_message.reply_text("Il file di backup deve essere uno .zip.")
+        return
+
+    temp_dir = Path("./state_backups/incoming")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / replied.document.file_name
+
+    try:
+        telegram_file = await replied.document.get_file()
+        await telegram_file.download_to_drive(custom_path=temp_path)
+        store = get_store(context)
+        result = restore_state_backup(temp_path, store.path)
+        await update.effective_message.reply_text(
+            "Stato ripristinato. "
+            "Ti consiglio di riavviare il bot adesso, cosi scheduler e comandi ripartono puliti."
+        )
+        if result.safety_copy_path:
+            LOGGER.info("State restored; previous database copied to %s", result.safety_copy_path)
+    except Exception as exc:
+        LOGGER.exception("State restore failed")
+        await update.effective_message.reply_text(f"Restore fallito: {exc}")
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def format_add_result(result: AddMediaResult) -> str:
@@ -824,6 +896,8 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("post_now", post_now_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("mark_published", mark_published_command))
+    application.add_handler(CommandHandler("backup_state", backup_state_command))
+    application.add_handler(CommandHandler("restore_state", restore_state_command))
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, handle_channel_text))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
 

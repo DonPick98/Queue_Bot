@@ -52,6 +52,14 @@ state_backups\
 
 Il backup usa la API SQLite `backup`, quindi crea una copia coerente anche se il bot e acceso. Per massima prudenza, prima di migrare su un nuovo host ferma comunque il bot locale.
 
+Da Telegram puoi fare la stessa cosa con:
+
+```text
+/backup_state
+```
+
+Il bot ti invia un file `.zip` contenente tutto lo stato.
+
 ## Restore
 
 Ferma il bot, poi:
@@ -67,6 +75,19 @@ Oppure:
 ```
 
 Il restore crea prima una copia di sicurezza del database esistente.
+
+Da Telegram, su un nuovo host:
+
+1. avvia il bot;
+2. assicurati di essere admin, tramite `ADMIN_USER_IDS` o primo `/start`;
+3. invia al bot il file backup `.zip`;
+4. rispondi a quel file con:
+
+```text
+/restore_state CONFIRM
+```
+
+Dopo il restore, riavvia il bot. Non e obbligatorio per il database, ma e consigliato per far ripartire scheduler e impostazioni in modo pulito.
 
 ## Regola operativa importante
 

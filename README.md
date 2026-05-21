@@ -167,6 +167,13 @@ backup_state.bat
 restore_state.bat
 ```
 
+Oppure direttamente da Telegram:
+
+```text
+/backup_state
+/restore_state CONFIRM
+```
+
 Dettagli in `STATE_AND_GITHUB.md`.
 
 ## Come lavora il bilanciamento
