@@ -1,0 +1,12 @@
+[project]
+name = "queue-bot"
+version = "0.1.0"
+description = "Telegram bot that queues photos/videos and publishes them to a channel on a balanced schedule."
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot[job-queue]==22.7",
+    "python-dotenv==1.0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
