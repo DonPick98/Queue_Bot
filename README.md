@@ -158,6 +158,13 @@ POST /api/queue/video
 
 Da proteggere con `QUEUE_API_TOKEN`.
 
+Per inviare rapidamente foto e video da iPhone con Apple Shortcuts o Scriptable:
+
+```text
+APPLE_SHORTCUTS.md
+apple_shortcuts/QueueToBot.scriptable.js
+```
+
 ## GitHub e stato portabile
 
 Il codice puo stare su GitHub, ma lo stato del bot resta fuori dal repository. Per migrare coda e impostazioni tra PC, Raspberry e servizi cloud usa:
