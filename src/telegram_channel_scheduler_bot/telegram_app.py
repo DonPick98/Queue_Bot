@@ -309,6 +309,7 @@ def build_help_text() -> str:
         "/set_batch 3 - batch fisso da 3 post singoli\n"
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
+        "/post_all CONFIRM - pubblica tutta la coda per svuotarla\n"
         f"Alert coda: ti avviso se non copre le prossime {QUEUE_ALERT_HOURS} ore\n"
         "/backup - ricevi un backup zip di coda e impostazioni\n"
         "/restore - istruzioni per ripristinare un backup zip\n"
@@ -539,6 +540,35 @@ async def post_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     outcomes = await publish_many(context.application, count=count, manual=True)
     await update.effective_message.reply_text(format_publish_outcomes(outcomes))
+    await check_queue_coverage_alert(context.application, notify=True)
+
+
+async def post_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    queued = store.queued_counts_by_type()
+    total = sum(queued.values())
+    if total == 0:
+        await update.effective_message.reply_text("La coda e gia vuota.")
+        return
+
+    if not context.args or context.args[0] != "CONFIRM":
+        await update.effective_message.reply_text(
+            "Comando di emergenza: pubblica tutta la coda sul canale, come post singoli, "
+            "e quindi la svuota.\n\n"
+            f"Adesso pubblicherebbe {total} media ({queued[PHOTO]} foto, {queued[VIDEO]} video).\n\n"
+            "Per confermare usa:\n"
+            "/post_all CONFIRM"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"Ok, pubblico tutta la coda: {total} media. Potrebbe volerci qualche minuto."
+    )
+    outcomes = await publish_many(context.application, count=total, manual=True)
+    await update.effective_message.reply_text(format_publish_summary(outcomes, requested=total))
     await check_queue_coverage_alert(context.application, notify=True)
 
 
@@ -804,6 +834,19 @@ def format_publish_outcomes(outcomes: list[PublishOutcome]) -> str:
     return "\n".join(lines)
 
 
+def format_publish_summary(outcomes: list[PublishOutcome], requested: int) -> str:
+    published = [outcome for outcome in outcomes if outcome.status == "published"]
+    last = outcomes[-1] if outcomes else None
+    lines = [
+        f"Pubblicati {len(published)} contenuti su {requested} richiesti.",
+    ]
+    if last and last.status != "published":
+        lines.append(f"Mi sono fermato: {last.message}")
+    elif len(published) == requested:
+        lines.append("Coda svuotata.")
+    return "\n".join(lines)
+
+
 def format_queue_alert(coverage: QueueCoverage, queued_counts: dict[str, int]) -> str:
     return "\n".join(
         [
@@ -915,6 +958,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("post_now", post_now_command))
+    application.add_handler(CommandHandler("post_all", post_all_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("mark_published", mark_published_command))
     application.add_handler(CommandHandler(["backup_state", "backup"], backup_state_command))

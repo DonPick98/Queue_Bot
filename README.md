@@ -111,6 +111,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 - `/set_ratio 2 1`: circa due foto per ogni video.
 - `/post_now`: pubblica subito il prossimo contenuto, anche se il bot e in pausa.
 - `/post_now 3`: pubblica subito 3 contenuti, come post singoli separati.
+- `/post_all CONFIRM`: comando di emergenza, pubblica tutta la coda come post singoli e la svuota.
 - `/pause`: ferma la pubblicazione automatica.
 - `/resume`: riattiva la pubblicazione automatica.
 - `/remove ID`: rimuove un contenuto dalla coda.
