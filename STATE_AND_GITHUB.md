@@ -55,7 +55,7 @@ Il backup usa la API SQLite `backup`, quindi crea una copia coerente anche se il
 Da Telegram puoi fare la stessa cosa con:
 
 ```text
-/backup_state
+/backup
 ```
 
 Il bot ti invia un file `.zip` contenente tutto lo stato.
@@ -87,7 +87,19 @@ Da Telegram, su un nuovo host:
 /restore_state CONFIRM
 ```
 
-Dopo il restore, riavvia il bot. Non e obbligatorio per il database, ma e consigliato per far ripartire scheduler e impostazioni in modo pulito.
+Dopo il restore, il bot si chiude automaticamente. L'host deve riavviarlo:
+
+- cloud provider: di solito succede automaticamente;
+- Windows autostart/manuale: riapri `start_bot.bat` se la finestra resta chiusa;
+- systemd/Raspberry: `Restart=always` lo riavvia da solo.
+
+Se non ricordi il comando esatto, manda:
+
+```text
+/restore
+```
+
+e il bot ti risponde con le istruzioni.
 
 ## Regola operativa importante
 

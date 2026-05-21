@@ -170,7 +170,8 @@ restore_state.bat
 Oppure direttamente da Telegram:
 
 ```text
-/backup_state
+/backup
+/restore
 /restore_state CONFIRM
 ```
 

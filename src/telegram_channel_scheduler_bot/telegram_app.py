@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
 import math
+import os
 from pathlib import Path
 import re
 
@@ -309,7 +310,8 @@ def build_help_text() -> str:
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
         f"Alert coda: ti avviso se non copre le prossime {QUEUE_ALERT_HOURS} ore\n"
-        "/backup_state - ricevi un backup zip di coda e impostazioni\n"
+        "/backup - ricevi un backup zip di coda e impostazioni\n"
+        "/restore - istruzioni per ripristinare un backup zip\n"
         "/restore_state CONFIRM - ripristina rispondendo a un backup zip\n"
         "/pause - pausa la pubblicazione automatica\n"
         "/resume - riattiva la pubblicazione automatica\n"
@@ -595,6 +597,7 @@ async def restore_state_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text(
             "Per ripristinare lo stato, rispondi al file backup .zip con:\n"
             "/restore_state CONFIRM\n\n"
+            "Shortcut mentale: manda /restore per rivedere queste istruzioni.\n"
             "Attenzione: sostituisce coda e impostazioni attuali."
         )
         return
@@ -618,17 +621,35 @@ async def restore_state_command(update: Update, context: ContextTypes.DEFAULT_TY
         store = get_store(context)
         result = restore_state_backup(temp_path, store.path)
         await update.effective_message.reply_text(
-            "Stato ripristinato. "
-            "Ti consiglio di riavviare il bot adesso, cosi scheduler e comandi ripartono puliti."
+            "Stato ripristinato. Ora riavvio automaticamente il bot."
         )
         if result.safety_copy_path:
             LOGGER.info("State restored; previous database copied to %s", result.safety_copy_path)
+        asyncio.create_task(shutdown_after_restore())
     except Exception as exc:
         LOGGER.exception("State restore failed")
         await update.effective_message.reply_text(f"Restore fallito: {exc}")
     finally:
         if temp_path.exists():
             temp_path.unlink()
+
+
+async def shutdown_after_restore() -> None:
+    await asyncio.sleep(2)
+    LOGGER.info("Exiting after state restore so the host can restart the bot.")
+    os._exit(0)
+
+
+async def restore_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    await update.effective_message.reply_text(
+        "Restore facile:\n"
+        "1. Mandami il file backup .zip.\n"
+        "2. Rispondi a quel file con /restore_state CONFIRM.\n"
+        "3. Dopo il restore mi riavvio da solo.\n\n"
+        "Per creare un backup usa /backup."
+    )
 
 
 def format_add_result(result: AddMediaResult) -> str:
@@ -896,8 +917,9 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("post_now", post_now_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("mark_published", mark_published_command))
-    application.add_handler(CommandHandler("backup_state", backup_state_command))
+    application.add_handler(CommandHandler(["backup_state", "backup"], backup_state_command))
     application.add_handler(CommandHandler("restore_state", restore_state_command))
+    application.add_handler(CommandHandler("restore", restore_help_command))
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, handle_channel_text))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
 
