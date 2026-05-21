@@ -66,6 +66,25 @@ class StoreTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertGreaterEqual(second, first)
 
+    def test_get_queued_item_chronological_returns_oldest_matching_type(self):
+        store = self.make_store()
+        store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        store.add_media("video", "file-video-1", "unique-video-1", None, 123)
+        store.add_media("photo", "file-photo-2", "unique-photo-2", None, 123)
+
+        first_photo = store.get_queued_item("photo", order="chronological")
+
+        self.assertEqual(first_photo.file_unique_id, "unique-photo-1")
+
+    def test_get_queued_item_random_respects_requested_type(self):
+        store = self.make_store()
+        store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        store.add_media("video", "file-video-1", "unique-video-1", None, 123)
+
+        item = store.get_queued_item("video", order="random")
+
+        self.assertEqual(item.media_type, "video")
+
 
 if __name__ == "__main__":
     unittest.main()

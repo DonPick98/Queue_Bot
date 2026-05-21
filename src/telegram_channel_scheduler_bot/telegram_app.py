@@ -32,6 +32,7 @@ from .posting_plan import (
     initial_next_publish_at,
     seconds_until_next_publish,
 )
+from .queue_order import parse_queue_order
 from .state_archive import create_state_backup, restore_state_backup
 from .storage import AddMediaResult, MediaItem, Store
 
@@ -318,6 +319,8 @@ def build_help_text() -> str:
         "/set_interval 2h - imposta ogni quanto pubblicare\n"
         "/set_batch auto - batch automatico: 2 sopra 20, 3 sopra 40\n"
         "/set_batch 3 - batch fisso da 3 post singoli\n"
+        "/set_queue_order random - pesca casuale dalla coda\n"
+        "/set_queue_order chronological - usa ordine di arrivo\n"
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
         "/post_all CONFIRM - pubblica tutta la coda per svuotarla\n"
@@ -420,6 +423,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     photo_ratio = store.get_int_setting("photo_ratio", 1)
     video_ratio = store.get_int_setting("video_ratio", 1)
     failed = store.failed_count()
+    queue_order = store.get_setting("queue_order", "random") or "random"
 
     await update.effective_message.reply_text(
         "\n".join(
@@ -429,6 +433,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Intervallo: {format_duration(interval)}",
                 f"Prossimo post: {format_next_publish_status(next_publish_at)}",
                 f"Post per ciclo: {batch_description}",
+                f"Ordine coda: {queue_order}",
                 f"Copertura {QUEUE_ALERT_HOURS}h: {format_coverage_status(coverage)}",
                 f"Rapporto foto/video: {photo_ratio}:{video_ratio}",
                 f"Coda: {queued[PHOTO]} foto, {queued[VIDEO]} video",
@@ -557,6 +562,35 @@ async def set_batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Ok: batch fisso da {count} contenuti singoli a ogni intervallo."
     )
     await check_queue_coverage_alert(context.application, notify=True)
+
+
+async def set_queue_order_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    if not context.args:
+        current = get_store(context).get_setting("queue_order", "random") or "random"
+        await update.effective_message.reply_text(
+            "Uso: /set_queue_order random oppure /set_queue_order chronological\n"
+            f"Adesso: {current}"
+        )
+        return
+
+    try:
+        queue_order = parse_queue_order(context.args[0])
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+
+    get_store(context).set_setting("queue_order", queue_order)
+    if queue_order == "random":
+        await update.effective_message.reply_text(
+            "Ok: pubblichero rispettando il ratio foto/video, ma pescando casualmente dentro la coda."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Ok: pubblichero rispettando il ratio foto/video e scegliendo i media in ordine di arrivo."
+        )
 
 
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -822,7 +856,8 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
     if media_type is None:
         return PublishOutcome(status="empty", message="La coda e vuota.")
 
-    item = store.get_oldest_queued(media_type) or store.get_oldest_queued()
+    queue_order = store.get_setting("queue_order", "random") or "random"
+    item = store.get_queued_item(media_type, order=queue_order) or store.get_queued_item(order=queue_order)
     if item is None:
         return PublishOutcome(status="empty", message="La coda e vuota.")
 
@@ -1019,6 +1054,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("set_channel", set_channel_command))
     application.add_handler(CommandHandler("set_interval", set_interval_command))
     application.add_handler(CommandHandler("set_batch", set_batch_command))
+    application.add_handler(CommandHandler(["set_queue_order", "set_order"], set_queue_order_command))
     application.add_handler(CommandHandler("set_ratio", set_ratio_command))
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))

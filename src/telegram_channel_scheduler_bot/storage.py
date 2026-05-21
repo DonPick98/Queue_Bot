@@ -122,6 +122,7 @@ class Store:
             "paused": "false",
             "last_published_type": "",
             "queue_alert_active": "false",
+            "queue_order": "random",
         }
         if config.channel_id:
             defaults["channel_id"] = config.channel_id
@@ -360,20 +361,25 @@ class Store:
             ).fetchone()
         return row["published_at"] if row else None
 
-    def get_oldest_queued(self, media_type: str | None = None) -> MediaItem | None:
+    def get_queued_item(self, media_type: str | None = None, order: str = "chronological") -> MediaItem | None:
+        if order == "random":
+            order_by = "RANDOM()"
+        else:
+            order_by = "added_at ASC, id ASC"
+
         if media_type:
-            sql = """
+            sql = f"""
                 SELECT * FROM media_items
                 WHERE status = ? AND media_type = ?
-                ORDER BY added_at ASC, id ASC
+                ORDER BY {order_by}
                 LIMIT 1
             """
             params: tuple[object, ...] = (QUEUED, media_type)
         else:
-            sql = """
+            sql = f"""
                 SELECT * FROM media_items
                 WHERE status = ?
-                ORDER BY added_at ASC, id ASC
+                ORDER BY {order_by}
                 LIMIT 1
             """
             params = (QUEUED,)
@@ -381,6 +387,9 @@ class Store:
         with self.connect() as connection:
             row = connection.execute(sql, params).fetchone()
         return self._row_to_media_item(row) if row else None
+
+    def get_oldest_queued(self, media_type: str | None = None) -> MediaItem | None:
+        return self.get_queued_item(media_type=media_type, order="chronological")
 
     def list_queued(self, limit: int = 10) -> list[MediaItem]:
         with self.connect() as connection:

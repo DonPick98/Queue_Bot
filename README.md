@@ -108,6 +108,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 - `/set_interval 2h`: pubblica ogni 2 ore.
 - `/set_batch auto`: pubblica 1 media fino a 20 in coda, 2 sopra 20, 3 sopra 40.
 - `/set_batch 3`: pubblica 3 media a ogni intervallo, come 3 post singoli separati.
+- `/set_queue_order random`: default, rispetta il ratio foto/video ma pesca casualmente dalla coda.
+- `/set_queue_order chronological`: rispetta il ratio foto/video e usa l'ordine di arrivo.
 - `/set_ratio 1 1`: bilanciamento pari tra foto e video.
 - `/set_ratio 2 1`: circa due foto per ogni video.
 - `/post_now`: pubblica subito il prossimo contenuto, anche se il bot e in pausa.
