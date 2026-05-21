@@ -143,6 +143,12 @@ build_justrunmy_zip.bat
 
 Leggi `JUSTRUNMY_APP.md` per variabili ambiente, path del database persistente e backup.
 
+Per Tranger Cloud:
+
+```text
+TRANGER_CLOUD.md
+```
+
 Include anche una API privata opzionale per upload veloci:
 
 ```text
