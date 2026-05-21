@@ -28,9 +28,14 @@ TELEGRAM_CHANNEL_ID=@nome_del_tuo_canale
 DEFAULT_POST_INTERVAL_MINUTES=60
 DEFAULT_BATCH_MODE=fixed
 DEFAULT_POSTS_PER_RUN=1
+DEFAULT_QUEUE_ORDER=random
 DEFAULT_PHOTO_RATIO=1
 DEFAULT_VIDEO_RATIO=1
 BALANCE_WINDOW=20
+DEFAULT_TIMEZONE=Europe/Rome
+DEFAULT_POSTING_WINDOWS=all
+AUTO_BACKUP_ENABLED=false
+AUTO_BACKUP_INTERVAL_MINUTES=1440
 DATABASE_PATH=./data/bot.sqlite3
 ```
 
@@ -100,12 +105,17 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 ## Comandi
 
 - `/start` o `/help`: guida rapida.
+- `/dashboard`: pannello con bottoni per gestire il bot senza ricordare i comandi.
 - `/web_url`: mostra l'URL pubblico per Apple Shortcuts/API, se il bot riesce a rilevarlo.
 - `/status`: configurazione, coda e conteggi.
 - `/queue`: primi elementi in coda.
 - `/set_channel @canale`: imposta il canale.
 - `/set_interval 30m`: pubblica ogni 30 minuti.
 - `/set_interval 2h`: pubblica ogni 2 ore.
+- `/set_next 10:00`: imposta manualmente il prossimo orario di pubblicazione nel timezone configurato.
+- `/set_timezone Europe/Rome`: imposta il fuso orario usato da status, dashboard e orari manuali.
+- `/set_posting_hours 10:00-23:30`: pubblica solo dentro quella fascia.
+- `/set_posting_hours all`: rimuove limiti di fascia oraria.
 - `/set_batch auto`: pubblica 1 media fino a 20 in coda, 2 sopra 20, 3 sopra 40.
 - `/set_batch 3`: pubblica 3 media a ogni intervallo, come 3 post singoli separati.
 - `/set_queue_order random`: default, rispetta il ratio foto/video ma pesca casualmente dalla coda.
@@ -115,6 +125,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 - `/post_now`: pubblica subito il prossimo contenuto, anche se il bot e in pausa.
 - `/post_now 3`: pubblica subito 3 contenuti, come post singoli separati.
 - `/post_all CONFIRM`: comando di emergenza, pubblica tutta la coda come post singoli e la svuota.
+- `/set_auto_backup 24h`: invia automaticamente un backup zip agli admin ogni 24 ore.
+- `/set_auto_backup off`: spegne il backup automatico.
 - `/pause`: ferma la pubblicazione automatica.
 - `/resume`: riattiva la pubblicazione automatica.
 - `/remove ID`: rimuove un contenuto dalla coda.

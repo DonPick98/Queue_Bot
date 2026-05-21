@@ -4,6 +4,9 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from .queue_order import parse_queue_order
+from .scheduling import DEFAULT_POSTING_WINDOWS, DEFAULT_TIMEZONE, parse_posting_windows, validate_timezone
+
 
 def _load_dotenv_if_available() -> None:
     try:
@@ -50,6 +53,24 @@ def _batch_mode(name: str, default: str = "fixed") -> str:
     return raw
 
 
+def _bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _queue_order(name: str, default: str = "random") -> str:
+    raw = os.getenv(name, default)
+    return parse_queue_order(raw)
+
+
+def _posting_windows(name: str, default: str = DEFAULT_POSTING_WINDOWS) -> str:
+    raw = os.getenv(name, default).strip() or default
+    parse_posting_windows(raw)
+    return raw
+
+
 @dataclass(frozen=True)
 class AppConfig:
     bot_token: str
@@ -62,6 +83,11 @@ class AppConfig:
     default_photo_ratio: int
     default_video_ratio: int
     balance_window: int
+    default_queue_order: str
+    default_timezone: str
+    default_posting_windows: str
+    default_auto_backup_enabled: bool
+    default_auto_backup_interval_minutes: int
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -82,4 +108,9 @@ class AppConfig:
             default_photo_ratio=_positive_int("DEFAULT_PHOTO_RATIO", 1),
             default_video_ratio=_positive_int("DEFAULT_VIDEO_RATIO", 1),
             balance_window=_positive_int("BALANCE_WINDOW", 20),
+            default_queue_order=_queue_order("DEFAULT_QUEUE_ORDER", "random"),
+            default_timezone=validate_timezone(os.getenv("DEFAULT_TIMEZONE", DEFAULT_TIMEZONE)),
+            default_posting_windows=_posting_windows("DEFAULT_POSTING_WINDOWS", DEFAULT_POSTING_WINDOWS),
+            default_auto_backup_enabled=_bool("AUTO_BACKUP_ENABLED", False),
+            default_auto_backup_interval_minutes=_positive_int("AUTO_BACKUP_INTERVAL_MINUTES", 24 * 60),
         )

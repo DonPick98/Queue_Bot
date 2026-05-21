@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 import logging
 import math
 import os
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo
 
-from telegram import Message, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -33,12 +35,22 @@ from .posting_plan import (
     seconds_until_next_publish,
 )
 from .queue_order import parse_queue_order
+from .scheduling import (
+    DEFAULT_TIMEZONE,
+    format_posting_windows,
+    is_within_posting_windows,
+    next_allowed_datetime,
+    next_publish_after_interval,
+    parse_posting_windows,
+    validate_timezone,
+)
 from .state_archive import create_state_backup, restore_state_backup
 from .storage import AddMediaResult, MediaItem, Store
 
 
 LOGGER = logging.getLogger(__name__)
 PUBLISH_JOB_NAME = "publisher"
+BACKUP_JOB_NAME = "auto_backup"
 MAX_POSTS_PER_RUN = 20
 PUBLIC_URL_ENV_KEYS = (
     "PUBLIC_BASE_URL",
@@ -125,8 +137,20 @@ def parse_datetime_setting(raw: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def format_datetime_for_user(value: datetime) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+def get_timezone_name(store: Store) -> str:
+    raw = store.get_setting("timezone", DEFAULT_TIMEZONE) or DEFAULT_TIMEZONE
+    try:
+        return validate_timezone(raw)
+    except ValueError:
+        return DEFAULT_TIMEZONE
+
+
+def get_posting_windows(store: Store) -> str:
+    return store.get_setting("posting_windows", "all") or "all"
+
+
+def format_datetime_for_user(value: datetime, timezone_name: str = DEFAULT_TIMEZONE) -> str:
+    return value.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d %H:%M")
 
 
 def parse_duration_minutes(raw: str) -> int:
@@ -218,7 +242,10 @@ def get_or_initialize_next_publish_at(store: Store, now: datetime | None = None)
     current_time = now or utcnow()
     existing = parse_datetime_setting(store.get_setting("next_publish_at"))
     if existing is not None:
-        return existing
+        adjusted = next_allowed_datetime(existing, get_timezone_name(store), get_posting_windows(store))
+        if adjusted != existing:
+            store.set_setting("next_publish_at", datetime_to_setting(adjusted))
+        return adjusted
 
     last_published_at = parse_datetime_setting(store.latest_published_at())
     next_publish_at = initial_next_publish_at(
@@ -226,24 +253,57 @@ def get_or_initialize_next_publish_at(store: Store, now: datetime | None = None)
         store.get_int_setting("interval_minutes", 60),
         last_published_at=last_published_at,
     )
+    next_publish_at = next_allowed_datetime(next_publish_at, get_timezone_name(store), get_posting_windows(store))
     store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
     return next_publish_at
 
 
 def set_next_publish_after_interval(store: Store, now: datetime | None = None) -> datetime:
-    next_publish_at = (now or utcnow()) + timedelta(
-        minutes=store.get_int_setting("interval_minutes", 60)
+    next_publish_at = next_publish_after_interval(
+        now or utcnow(),
+        store.get_int_setting("interval_minutes", 60),
+        get_timezone_name(store),
+        get_posting_windows(store),
     )
     store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
     return next_publish_at
 
 
-def format_next_publish_status(next_publish_at: datetime, now: datetime | None = None) -> str:
+def format_next_publish_status(
+    next_publish_at: datetime,
+    now: datetime | None = None,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> str:
     current_time = now or utcnow()
     if next_publish_at <= current_time:
         return "appena possibile"
     minutes = max(1, math.ceil((next_publish_at - current_time).total_seconds() / 60))
-    return f"{format_datetime_for_user(next_publish_at)} (tra {format_duration(minutes)})"
+    return f"{format_datetime_for_user(next_publish_at, timezone_name)} (tra {format_duration(minutes)})"
+
+
+def parse_local_next_publish(raw: str, store: Store, now: datetime | None = None) -> datetime:
+    value = raw.strip()
+    zone = ZoneInfo(get_timezone_name(store))
+    current_local = (now or utcnow()).astimezone(zone)
+
+    if re.fullmatch(r"\d{1,2}:?\d{0,2}", value):
+        chunks = value.split(":", 1)
+        hour = int(chunks[0])
+        minute = int(chunks[1]) if len(chunks) == 2 and chunks[1] else 0
+        if hour > 23 or minute > 59:
+            raise ValueError("Orario non valido. Esempio: /set_next 10:00")
+        candidate = datetime.combine(current_local.date(), time(hour=hour, minute=minute), tzinfo=zone)
+        if candidate <= current_local:
+            candidate += timedelta(days=1)
+        return next_allowed_datetime(candidate.astimezone(UTC), get_timezone_name(store), get_posting_windows(store))
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("Uso: /set_next 10:00 oppure /set_next 2026-05-22 10:00") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return next_allowed_datetime(parsed.astimezone(UTC), get_timezone_name(store), get_posting_windows(store))
 
 
 def is_configured_channel(store: Store, message: Message) -> bool:
@@ -316,12 +376,17 @@ def build_help_text() -> str:
         "/set_channel @canale - imposta il canale di destinazione\n"
         "/set_channel_here - da scrivere nel canale privato per impostarlo\n"
         "/channel_id - da scrivere nel canale privato per vedere il suo ID\n"
+        "/dashboard - pannello con bottoni\n"
         "/set_interval 2h - imposta ogni quanto pubblicare\n"
+        "/set_next 10:00 - imposta manualmente il prossimo orario\n"
+        "/set_timezone Europe/Rome - imposta il fuso orario\n"
+        "/set_posting_hours 10:00-23:30 - limita le pubblicazioni\n"
         "/set_batch auto - batch automatico: 2 sopra 20, 3 sopra 40\n"
         "/set_batch 3 - batch fisso da 3 post singoli\n"
         "/set_queue_order random - pesca casuale dalla coda\n"
         "/set_queue_order chronological - usa ordine di arrivo\n"
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
+        "/set_auto_backup 24h - backup automatico via Telegram\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
         "/post_all CONFIRM - pubblica tutta la coda per svuotarla\n"
         f"Alert coda: ti avviso se non copre le prossime {QUEUE_ALERT_HOURS} ore\n"
@@ -424,16 +489,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     video_ratio = store.get_int_setting("video_ratio", 1)
     failed = store.failed_count()
     queue_order = store.get_setting("queue_order", "random") or "random"
+    timezone_name = get_timezone_name(store)
+    posting_windows = get_posting_windows(store)
+    auto_backup = store.get_bool_setting("auto_backup_enabled")
 
     await update.effective_message.reply_text(
         "\n".join(
             [
                 f"Canale: {channel}",
                 f"Stato: {'in pausa' if paused else 'attivo'}",
+                f"Timezone: {timezone_name}",
                 f"Intervallo: {format_duration(interval)}",
-                f"Prossimo post: {format_next_publish_status(next_publish_at)}",
+                f"Fasce orarie: {format_posting_windows(posting_windows)}",
+                f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
                 f"Post per ciclo: {batch_description}",
                 f"Ordine coda: {queue_order}",
+                f"Auto-backup: {'attivo' if auto_backup else 'spento'}",
                 f"Copertura {QUEUE_ALERT_HOURS}h: {format_coverage_status(coverage)}",
                 f"Rapporto foto/video: {photo_ratio}:{video_ratio}",
                 f"Coda: {queued[PHOTO]} foto, {queued[VIDEO]} video",
@@ -442,6 +513,250 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ]
         )
     )
+
+
+def build_dashboard_text(store: Store) -> str:
+    queued = store.queued_counts_by_type()
+    coverage = get_queue_coverage(store, queued)
+    next_publish_at = get_or_initialize_next_publish_at(store)
+    timezone_name = get_timezone_name(store)
+    paused = store.get_bool_setting("paused")
+    return "\n".join(
+        [
+            "Queue Bot Dashboard",
+            "",
+            f"Stato: {'in pausa' if paused else 'attivo'}",
+            f"Coda: {queued[PHOTO]} foto, {queued[VIDEO]} video",
+            f"Prossimo: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
+            f"Intervallo: {format_duration(store.get_int_setting('interval_minutes', 60))}",
+            f"Fasce: {format_posting_windows(get_posting_windows(store))}",
+            f"Timezone: {timezone_name}",
+            f"Batch: {describe_batch_setting(store, queued)}",
+            f"Ordine: {store.get_setting('queue_order', 'random') or 'random'}",
+            f"Ratio: {store.get_int_setting('photo_ratio', 1)}:{store.get_int_setting('video_ratio', 1)}",
+            f"Copertura 24h: {format_coverage_status(coverage)}",
+            f"Auto-backup: {'attivo' if store.get_bool_setting('auto_backup_enabled') else 'spento'}",
+        ]
+    )
+
+
+def dashboard_keyboard(store: Store, view: str = "main") -> InlineKeyboardMarkup:
+    paused = store.get_bool_setting("paused")
+    if view == "settings":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Intervallo 30m", callback_data="dash:int:30"),
+                    InlineKeyboardButton("1h", callback_data="dash:int:60"),
+                    InlineKeyboardButton("2h", callback_data="dash:int:120"),
+                ],
+                [
+                    InlineKeyboardButton("Batch auto", callback_data="dash:batch:auto"),
+                    InlineKeyboardButton("Batch 1", callback_data="dash:batch:1"),
+                    InlineKeyboardButton("Batch 2", callback_data="dash:batch:2"),
+                    InlineKeyboardButton("Batch 3", callback_data="dash:batch:3"),
+                ],
+                [
+                    InlineKeyboardButton("Ordine random", callback_data="dash:order:random"),
+                    InlineKeyboardButton("Cronologico", callback_data="dash:order:chronological"),
+                ],
+                [
+                    InlineKeyboardButton("Ratio 1:1", callback_data="dash:ratio:1:1"),
+                    InlineKeyboardButton("2:1", callback_data="dash:ratio:2:1"),
+                    InlineKeyboardButton("1:2", callback_data="dash:ratio:1:2"),
+                ],
+                [InlineKeyboardButton("Indietro", callback_data="dash:main")],
+            ]
+        )
+    if view == "schedule":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Prossimo 09:00", callback_data="dash:next:09:00"),
+                    InlineKeyboardButton("10:00", callback_data="dash:next:10:00"),
+                    InlineKeyboardButton("12:00", callback_data="dash:next:12:00"),
+                ],
+                [
+                    InlineKeyboardButton("18:00", callback_data="dash:next:18:00"),
+                    InlineKeyboardButton("20:00", callback_data="dash:next:20:00"),
+                    InlineKeyboardButton("22:00", callback_data="dash:next:22:00"),
+                ],
+                [
+                    InlineKeyboardButton("Tutto il giorno", callback_data="dash:hours:all"),
+                    InlineKeyboardButton("10-23:30", callback_data="dash:hours:10:00-23:30"),
+                ],
+                [
+                    InlineKeyboardButton("09-13,15-23", callback_data="dash:hours:09:00-13:00,15:00-23:00"),
+                    InlineKeyboardButton("Europe/Rome", callback_data="dash:tz:Europe/Rome"),
+                    InlineKeyboardButton("UTC", callback_data="dash:tz:UTC"),
+                ],
+                [InlineKeyboardButton("Indietro", callback_data="dash:main")],
+            ]
+        )
+    if view == "backup":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Backup ora", callback_data="dash:backupnow"),
+                    InlineKeyboardButton("Auto 24h", callback_data="dash:autobackup:24h"),
+                    InlineKeyboardButton("Auto 12h", callback_data="dash:autobackup:12h"),
+                ],
+                [
+                    InlineKeyboardButton("Auto off", callback_data="dash:autobackup:off"),
+                    InlineKeyboardButton("Indietro", callback_data="dash:main"),
+                ],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Pausa" if not paused else "Riprendi", callback_data="dash:pause" if not paused else "dash:resume"),
+                InlineKeyboardButton("Posta 1 ora", callback_data="dash:post1"),
+                InlineKeyboardButton("Aggiorna", callback_data="dash:main"),
+            ],
+            [
+                InlineKeyboardButton("Impostazioni", callback_data="dash:view:settings"),
+                InlineKeyboardButton("Orari", callback_data="dash:view:schedule"),
+                InlineKeyboardButton("Backup", callback_data="dash:view:backup"),
+            ],
+            [
+                InlineKeyboardButton("Coda", callback_data="dash:queue"),
+                InlineKeyboardButton("Status", callback_data="dash:status"),
+            ],
+        ]
+    )
+
+
+async def send_or_edit_dashboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    view: str = "main",
+    note: str | None = None,
+) -> None:
+    store = get_store(context)
+    text = build_dashboard_text(store)
+    if note:
+        text = f"{note}\n\n{text}"
+    markup = dashboard_keyboard(store, view)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+        except TelegramError as exc:
+            if "Message is not modified" not in str(exc):
+                raise
+    else:
+        await update.effective_message.reply_text(text=text, reply_markup=markup)
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    await send_or_edit_dashboard(update, context)
+
+
+async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    data = query.data
+    note: str | None = None
+    view = "main"
+
+    if data == "dash:main":
+        pass
+    elif data == "dash:pause":
+        store.set_setting("paused", "true")
+        note = "Pubblicazione automatica in pausa."
+    elif data == "dash:resume":
+        store.set_setting("paused", "false")
+        note = "Pubblicazione automatica riattivata."
+        await check_queue_coverage_alert(context.application, notify=True)
+    elif data == "dash:post1":
+        outcomes = await publish_many(context.application, count=1, manual=True)
+        note = format_publish_outcomes(outcomes)
+        await check_queue_coverage_alert(context.application, notify=True)
+    elif data == "dash:backupnow":
+        await send_state_backup(context.application, query.message.chat_id, prefix="Backup")
+        note = "Backup inviato."
+        view = "backup"
+    elif data == "dash:queue":
+        await queue_command(update, context)
+        return
+    elif data == "dash:status":
+        await status_command(update, context)
+        return
+    elif data.startswith("dash:view:"):
+        view = data.rsplit(":", 1)[-1]
+    elif data.startswith("dash:int:"):
+        minutes = int(data.rsplit(":", 1)[-1])
+        store.set_setting("interval_minutes", str(minutes))
+        next_publish_at = set_next_publish_after_interval(store)
+        schedule_publisher(context.application, store)
+        note = f"Intervallo impostato: {format_duration(minutes)}. Prossimo: {format_next_publish_status(next_publish_at, timezone_name=get_timezone_name(store))}."
+        view = "settings"
+    elif data.startswith("dash:batch:"):
+        value = data.rsplit(":", 1)[-1]
+        if value == "auto":
+            store.set_setting("batch_mode", "auto")
+            note = "Batch automatico attivo."
+        else:
+            store.set_setting("batch_mode", "fixed")
+            store.set_setting("posts_per_run", value)
+            note = f"Batch fisso da {value}."
+        view = "settings"
+    elif data.startswith("dash:order:"):
+        value = parse_queue_order(data.rsplit(":", 1)[-1])
+        store.set_setting("queue_order", value)
+        note = f"Ordine coda: {value}."
+        view = "settings"
+    elif data.startswith("dash:ratio:"):
+        _, _, photo_ratio, video_ratio = data.split(":")
+        store.set_setting("photo_ratio", photo_ratio)
+        store.set_setting("video_ratio", video_ratio)
+        note = f"Ratio foto/video: {photo_ratio}:{video_ratio}."
+        view = "settings"
+    elif data.startswith("dash:next:"):
+        raw = data.removeprefix("dash:next:")
+        next_publish_at = parse_local_next_publish(raw, store)
+        store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+        schedule_publisher(context.application, store)
+        note = f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=get_timezone_name(store))}."
+        view = "schedule"
+    elif data.startswith("dash:hours:"):
+        raw = data.removeprefix("dash:hours:")
+        parse_posting_windows(raw)
+        store.set_setting("posting_windows", raw)
+        next_publish_at = next_allowed_datetime(get_or_initialize_next_publish_at(store), get_timezone_name(store), raw)
+        store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+        schedule_publisher(context.application, store)
+        note = f"Fasce orarie: {format_posting_windows(raw)}."
+        view = "schedule"
+    elif data.startswith("dash:tz:"):
+        timezone_name = validate_timezone(data.removeprefix("dash:tz:"))
+        store.set_setting("timezone", timezone_name)
+        schedule_publisher(context.application, store)
+        note = f"Timezone: {timezone_name}."
+        view = "schedule"
+    elif data.startswith("dash:autobackup:"):
+        raw = data.rsplit(":", 1)[-1]
+        if raw == "off":
+            store.set_setting("auto_backup_enabled", "false")
+            note = "Auto-backup spento."
+        else:
+            interval = parse_duration_minutes(raw)
+            store.set_setting("auto_backup_enabled", "true")
+            store.set_setting("auto_backup_interval_minutes", str(interval))
+            store.set_setting("next_backup_at", datetime_to_setting(utcnow() + timedelta(minutes=interval)))
+            note = f"Auto-backup ogni {format_duration(interval)}."
+        schedule_auto_backup(context.application, store)
+        view = "backup"
+
+    await send_or_edit_dashboard(update, context, view=view, note=note)
 
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -508,9 +823,91 @@ async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYP
     schedule_publisher(context.application, store)
     await update.effective_message.reply_text(
         f"Intervallo aggiornato: {format_duration(minutes)}. "
-        f"Prossimo post: {format_next_publish_status(next_publish_at)}."
+        f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=get_timezone_name(store))}."
     )
     await check_queue_coverage_alert(context.application, notify=True)
+
+
+async def set_next_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text("Uso: /set_next 10:00 oppure /set_next 2026-05-22 10:00")
+        return
+
+    store = get_store(context)
+    try:
+        next_publish_at = parse_local_next_publish(" ".join(context.args), store)
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+
+    store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+    schedule_publisher(context.application, store)
+    await update.effective_message.reply_text(
+        f"Prossimo post impostato: {format_next_publish_status(next_publish_at, timezone_name=get_timezone_name(store))}."
+    )
+
+
+async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    if not context.args:
+        current = get_timezone_name(get_store(context))
+        await update.effective_message.reply_text(f"Uso: /set_timezone Europe/Rome\nAdesso: {current}")
+        return
+
+    try:
+        timezone_name = validate_timezone(context.args[0])
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+
+    store = get_store(context)
+    store.set_setting("timezone", timezone_name)
+    next_publish_at = get_or_initialize_next_publish_at(store)
+    schedule_publisher(context.application, store)
+    await update.effective_message.reply_text(
+        f"Timezone aggiornata: {timezone_name}.\n"
+        f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}."
+    )
+
+
+async def set_posting_hours_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    if not context.args:
+        current = format_posting_windows(get_posting_windows(get_store(context)))
+        await update.effective_message.reply_text(
+            "Uso: /set_posting_hours 10:00-23:30 oppure /set_posting_hours all\n"
+            "Puoi usare piu finestre: /set_posting_hours 09:00-13:00,15:00-23:00\n"
+            f"Adesso: {current}"
+        )
+        return
+
+    raw = " ".join(context.args).strip()
+    try:
+        parse_posting_windows(raw)
+    except ValueError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+
+    store = get_store(context)
+    store.set_setting("posting_windows", raw)
+    next_publish_at = next_allowed_datetime(
+        get_or_initialize_next_publish_at(store),
+        get_timezone_name(store),
+        raw,
+    )
+    store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+    schedule_publisher(context.application, store)
+    await update.effective_message.reply_text(
+        f"Fasce orarie aggiornate: {format_posting_windows(raw)}.\n"
+        f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=get_timezone_name(store))}."
+    )
 
 
 async def set_ratio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -693,28 +1090,71 @@ async def mark_published_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async def backup_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_admin(update, context):
-        return
-
-    store = get_store(context)
-    await update.effective_message.reply_text("Creo backup dello stato del bot...")
+async def send_state_backup(application: Application, chat_id: int | str, prefix: str = "Backup") -> bool:
+    store = get_store(application)
     try:
         archive_path = create_state_backup(store.path, Path("./state_backups"))
     except Exception as exc:
         LOGGER.exception("State backup failed")
-        await update.effective_message.reply_text(f"Backup fallito: {exc}")
-        return
+        await application.bot.send_message(chat_id=chat_id, text=f"Backup fallito: {exc}")
+        return False
 
     with archive_path.open("rb") as backup_file:
-        await update.effective_message.reply_document(
+        await application.bot.send_document(
+            chat_id=chat_id,
             document=backup_file,
             filename=archive_path.name,
             caption=(
-                "Backup stato Queue Bot. Conserva questo file: contiene coda, "
+                f"{prefix} stato Queue Bot. Conserva questo file: contiene coda, "
                 "impostazioni, deduplica e prossimo orario di pubblicazione."
             ),
         )
+    return True
+
+
+async def backup_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    await update.effective_message.reply_text("Creo backup dello stato del bot...")
+    await send_state_backup(context.application, update.effective_chat.id, prefix="Backup")
+
+
+async def set_auto_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    if not context.args:
+        enabled = store.get_bool_setting("auto_backup_enabled")
+        interval = store.get_int_setting("auto_backup_interval_minutes", 24 * 60)
+        await update.effective_message.reply_text(
+            "Uso: /set_auto_backup on, /set_auto_backup off oppure /set_auto_backup 24h\n"
+            f"Adesso: {'attivo' if enabled else 'spento'}, intervallo {format_duration(interval)}"
+        )
+        return
+
+    value = context.args[0].strip().lower()
+    if value in {"off", "false", "no", "0", "spento"}:
+        store.set_setting("auto_backup_enabled", "false")
+        schedule_auto_backup(context.application, store)
+        await update.effective_message.reply_text("Auto-backup spento.")
+        return
+
+    if value in {"on", "true", "yes", "1", "attivo"}:
+        interval = store.get_int_setting("auto_backup_interval_minutes", 24 * 60)
+    else:
+        try:
+            interval = parse_duration_minutes(value)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+
+    store.set_setting("auto_backup_enabled", "true")
+    store.set_setting("auto_backup_interval_minutes", str(interval))
+    store.set_setting("next_backup_at", datetime_to_setting(utcnow() + timedelta(minutes=interval)))
+    schedule_auto_backup(context.application, store)
+    await update.effective_message.reply_text(f"Auto-backup attivo ogni {format_duration(interval)}.")
 
 
 async def restore_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -994,7 +1434,16 @@ async def check_queue_coverage_alert(application: Application, notify: bool = Tr
 
 async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     store = get_store(context)
+    advance_after_run = True
     try:
+        now = utcnow()
+        if not is_within_posting_windows(now, get_timezone_name(store), get_posting_windows(store)):
+            next_publish_at = next_allowed_datetime(now, get_timezone_name(store), get_posting_windows(store))
+            store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+            LOGGER.info("Outside posting window; next publish scheduled at %s", datetime_to_setting(next_publish_at))
+            advance_after_run = False
+            return
+
         queued = store.queued_counts_by_type()
         outcomes = await publish_many(
             context.application,
@@ -1005,8 +1454,10 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             LOGGER.info(format_publish_outcomes(outcomes))
         await check_queue_coverage_alert(context.application, notify=True)
     finally:
-        next_publish_at = set_next_publish_after_interval(store)
-        LOGGER.info("Next publish scheduled at %s", datetime_to_setting(next_publish_at))
+        if advance_after_run:
+            next_publish_at = set_next_publish_after_interval(store)
+            LOGGER.info("Next publish scheduled at %s", datetime_to_setting(next_publish_at))
+        schedule_publisher(context.application, store)
 
 
 def schedule_publisher(application: Application, store: Store) -> None:
@@ -1020,21 +1471,70 @@ def schedule_publisher(application: Application, store: Store) -> None:
         job.schedule_removal()
 
     now = utcnow()
-    interval_minutes = store.get_int_setting("interval_minutes", 60)
     next_publish_at = get_or_initialize_next_publish_at(store, now=now)
+    if next_publish_at <= now and not is_within_posting_windows(now, get_timezone_name(store), get_posting_windows(store)):
+        next_publish_at = next_allowed_datetime(now, get_timezone_name(store), get_posting_windows(store))
+    else:
+        next_publish_at = next_allowed_datetime(next_publish_at, get_timezone_name(store), get_posting_windows(store))
+    if next_publish_at != parse_datetime_setting(store.get_setting("next_publish_at")):
+        store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
     first_delay_seconds = seconds_until_next_publish(next_publish_at, now)
-    application.job_queue.run_repeating(
+    application.job_queue.run_once(
         publisher_job,
-        interval=timedelta(minutes=interval_minutes),
-        first=timedelta(seconds=first_delay_seconds),
+        when=timedelta(seconds=first_delay_seconds),
         name=PUBLISH_JOB_NAME,
     )
     LOGGER.info(
-        "Publisher scheduled: first run in %s seconds, interval %s minutes, next_publish_at=%s",
+        "Publisher scheduled: run in %s seconds, interval %s minutes, next_publish_at=%s",
         first_delay_seconds,
-        interval_minutes,
+        store.get_int_setting("interval_minutes", 60),
         datetime_to_setting(next_publish_at),
     )
+
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = get_store(context)
+    try:
+        if not store.get_bool_setting("auto_backup_enabled"):
+            return
+
+        admin_ids = store.get_admin_ids()
+        for admin_id in admin_ids:
+            try:
+                await send_state_backup(context.application, admin_id, prefix="Auto-backup")
+            except TelegramError:
+                LOGGER.exception("Auto-backup failed for admin %s", admin_id)
+    finally:
+        if store.get_bool_setting("auto_backup_enabled"):
+            interval = store.get_int_setting("auto_backup_interval_minutes", 24 * 60)
+            store.set_setting("next_backup_at", datetime_to_setting(utcnow() + timedelta(minutes=interval)))
+        schedule_auto_backup(context.application, store)
+
+
+def schedule_auto_backup(application: Application, store: Store) -> None:
+    if application.job_queue is None:
+        return
+
+    for job in application.job_queue.get_jobs_by_name(BACKUP_JOB_NAME):
+        job.schedule_removal()
+
+    if not store.get_bool_setting("auto_backup_enabled"):
+        return
+
+    now = utcnow()
+    interval = store.get_int_setting("auto_backup_interval_minutes", 24 * 60)
+    next_backup_at = parse_datetime_setting(store.get_setting("next_backup_at"))
+    if next_backup_at is None or next_backup_at <= now:
+        next_backup_at = now + timedelta(minutes=interval)
+        store.set_setting("next_backup_at", datetime_to_setting(next_backup_at))
+
+    delay = seconds_until_next_publish(next_backup_at, now)
+    application.job_queue.run_once(
+        auto_backup_job,
+        when=timedelta(seconds=delay),
+        name=BACKUP_JOB_NAME,
+    )
+    LOGGER.info("Auto-backup scheduled in %s seconds", delay)
 
 
 def build_application(config: AppConfig) -> Application:
@@ -1045,17 +1545,23 @@ def build_application(config: AppConfig) -> Application:
     application = ApplicationBuilder().token(config.bot_token).build()
     application.bot_data["store"] = store
 
+    application.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^dash:"))
     application.add_handler(CommandHandler("whoami", whoami_command))
     application.add_handler(CommandHandler(["web_url", "url"], web_url_command))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("queue", queue_command))
     application.add_handler(CommandHandler("set_channel", set_channel_command))
     application.add_handler(CommandHandler("set_interval", set_interval_command))
+    application.add_handler(CommandHandler("set_next", set_next_command))
+    application.add_handler(CommandHandler("set_timezone", set_timezone_command))
+    application.add_handler(CommandHandler("set_posting_hours", set_posting_hours_command))
     application.add_handler(CommandHandler("set_batch", set_batch_command))
     application.add_handler(CommandHandler(["set_queue_order", "set_order"], set_queue_order_command))
     application.add_handler(CommandHandler("set_ratio", set_ratio_command))
+    application.add_handler(CommandHandler("set_auto_backup", set_auto_backup_command))
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("post_now", post_now_command))
@@ -1069,6 +1575,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
 
     schedule_publisher(application, store)
+    schedule_auto_backup(application, store)
     return application
 
 

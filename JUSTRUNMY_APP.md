@@ -46,6 +46,11 @@ ADMIN_USER_IDS=...
 TELEGRAM_CHANNEL_ID=-100...
 DATABASE_PATH=/app/data/bot.sqlite3
 DEFAULT_BATCH_MODE=auto
+DEFAULT_QUEUE_ORDER=random
+DEFAULT_TIMEZONE=Europe/Rome
+DEFAULT_POSTING_WINDOWS=all
+AUTO_BACKUP_ENABLED=false
+AUTO_BACKUP_INTERVAL_MINUTES=1440
 ```
 
 Non caricare il tuo `.env` locale: contiene il token.

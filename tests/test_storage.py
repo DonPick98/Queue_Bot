@@ -24,6 +24,11 @@ class StoreTests(unittest.TestCase):
                 default_photo_ratio=1,
                 default_video_ratio=1,
                 balance_window=20,
+                default_queue_order="random",
+                default_timezone="Europe/Rome",
+                default_posting_windows="all",
+                default_auto_backup_enabled=False,
+                default_auto_backup_interval_minutes=24 * 60,
             )
         )
         return store

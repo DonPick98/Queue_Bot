@@ -122,7 +122,12 @@ class Store:
             "paused": "false",
             "last_published_type": "",
             "queue_alert_active": "false",
-            "queue_order": "random",
+            "queue_order": config.default_queue_order,
+            "timezone": config.default_timezone,
+            "posting_windows": config.default_posting_windows,
+            "auto_backup_enabled": "true" if config.default_auto_backup_enabled else "false",
+            "auto_backup_interval_minutes": str(config.default_auto_backup_interval_minutes),
+            "backup_alert_active": "false",
         }
         if config.channel_id:
             defaults["channel_id"] = config.channel_id
