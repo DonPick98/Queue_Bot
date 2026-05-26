@@ -39,6 +39,9 @@ AUTO_BACKUP_INTERVAL_MINUTES=1440
 BACKUP_AFTER_PUBLISH_ENABLED=true
 BACKUP_AFTER_PUBLISH_SEND_TELEGRAM=false
 BACKUP_AFTER_PUBLISH_PATH=./state_backups/latest-state.zip
+BACKUP_AUTO_RESTORE_ENABLED=true
+BACKUP_AUTO_RESTORE_IF_EMPTY=true
+BACKUP_BEFORE_SHUTDOWN_ENABLED=true
 DATABASE_PATH=./data/bot.sqlite3
 ```
 
@@ -150,6 +153,20 @@ Il bot salva nel database il prossimo orario previsto di pubblicazione. Se chiud
 - se il prossimo orario e passato, il bot pubblica appena possibile e poi riparte da quel momento con l'intervallo configurato.
 
 Il comando `/post_now` resta manuale e non sposta la schedule automatica.
+
+## Backup self-healing
+
+Il bot puo proteggersi da restart e deploy:
+
+- dopo ogni pubblicazione crea o sovrascrive `latest-state.zip`;
+- prima dello shutdown crea un altro backup rolling;
+- all'avvio, se il database manca, e vuoto o non sembra valido, prova a ripristinare automaticamente da `latest-state.zip`.
+
+Su host senza storage persistente conviene anche inviare il backup su Telegram:
+
+```text
+/set_publish_backup telegram
+```
 
 ## Deploy cloud
 

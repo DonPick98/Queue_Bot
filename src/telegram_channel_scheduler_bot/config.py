@@ -91,6 +91,9 @@ class AppConfig:
     default_backup_after_publish_enabled: bool
     default_backup_after_publish_send_telegram: bool
     default_backup_after_publish_path: str
+    backup_auto_restore_enabled: bool
+    backup_auto_restore_if_empty: bool
+    backup_before_shutdown_enabled: bool
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -123,4 +126,7 @@ class AppConfig:
                 "./state_backups/latest-state.zip",
             ).strip()
             or "./state_backups/latest-state.zip",
+            backup_auto_restore_enabled=_bool("BACKUP_AUTO_RESTORE_ENABLED", True),
+            backup_auto_restore_if_empty=_bool("BACKUP_AUTO_RESTORE_IF_EMPTY", True),
+            backup_before_shutdown_enabled=_bool("BACKUP_BEFORE_SHUTDOWN_ENABLED", True),
         )

@@ -44,7 +44,12 @@ from .scheduling import (
     parse_posting_windows,
     validate_timezone,
 )
-from .state_archive import create_rolling_state_backup, create_state_backup, restore_state_backup
+from .state_archive import (
+    create_rolling_state_backup,
+    create_state_backup,
+    restore_latest_backup_if_needed,
+    restore_state_backup,
+)
 from .storage import AddMediaResult, MediaItem, Store
 
 
@@ -1664,6 +1669,7 @@ def schedule_auto_backup(application: Application, store: Store) -> None:
 
 
 def build_application(config: AppConfig) -> Application:
+    auto_restore_state(config)
     store = Store(config.database_path)
     store.initialize()
     store.bootstrap(config)
@@ -1706,6 +1712,47 @@ def build_application(config: AppConfig) -> Application:
     return application
 
 
+def auto_restore_state(config: AppConfig) -> None:
+    if not config.backup_auto_restore_enabled:
+        return
+
+    try:
+        result = restore_latest_backup_if_needed(
+            config.database_path,
+            Path(config.default_backup_after_publish_path),
+            restore_if_empty=config.backup_auto_restore_if_empty,
+        )
+    except Exception:
+        LOGGER.exception("Auto-restore from latest backup failed")
+        return
+
+    if result:
+        LOGGER.warning(
+            "Auto-restored Queue Bot state from %s into %s (reason=%s, safety_copy=%s)",
+            result.backup_path,
+            result.database_path,
+            result.reason,
+            result.safety_copy_path,
+        )
+
+
+def backup_before_shutdown(application: Application, config: AppConfig) -> None:
+    if not config.backup_before_shutdown_enabled:
+        return
+
+    try:
+        store = application.bot_data.get("store")
+        if not store:
+            return
+        backup_path = create_rolling_state_backup(
+            store.path,
+            Path(store.get_setting("backup_after_publish_path", config.default_backup_after_publish_path)),
+        )
+        LOGGER.info("Shutdown backup written to %s", backup_path)
+    except Exception:
+        LOGGER.exception("Shutdown backup failed")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1718,4 +1765,7 @@ def main() -> None:
     application = build_application(config)
     start_http_server_from_env(application.bot_data["store"], config.bot_token)
     LOGGER.info("Bot avviato.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        backup_before_shutdown(application, config)

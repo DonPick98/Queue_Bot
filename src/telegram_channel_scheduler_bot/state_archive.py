@@ -16,6 +16,15 @@ class RestoreResult:
     safety_copy_path: Path | None
 
 
+@dataclass(frozen=True)
+class AutoRestoreResult:
+    restored: bool
+    reason: str
+    database_path: Path
+    backup_path: Path
+    safety_copy_path: Path | None = None
+
+
 def backup_database(source: Path, destination_db: Path) -> None:
     destination_db.parent.mkdir(parents=True, exist_ok=True)
     source_connection = sqlite3.connect(source)
@@ -86,7 +95,10 @@ def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path
     return target
 
 
-def validate_database(database_path: Path) -> None:
+def database_has_schema(database_path: Path) -> bool:
+    if not database_path.exists():
+        return False
+
     connection = sqlite3.connect(database_path)
     try:
         row = connection.execute(
@@ -94,8 +106,36 @@ def validate_database(database_path: Path) -> None:
         ).fetchone()
     finally:
         connection.close()
-    if row is None:
+    return row is not None
+
+
+def media_item_count(database_path: Path) -> int:
+    if not database_has_schema(database_path):
+        return 0
+
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute("SELECT COUNT(*) FROM media_items").fetchone()
+    finally:
+        connection.close()
+    return int(row[0] if row else 0)
+
+
+def validate_database(database_path: Path) -> None:
+    if not database_has_schema(database_path):
         raise ValueError("Backup does not look like a Queue Bot database.")
+
+
+def _extract_backup_database(backup_path: Path, extract_dir: Path) -> Path:
+    with zipfile.ZipFile(backup_path) as archive:
+        database_members = [name for name in archive.namelist() if name.endswith(".sqlite3")]
+        if len(database_members) != 1:
+            raise ValueError("Backup archive must contain exactly one .sqlite3 file.")
+        archive.extract(database_members[0], path=extract_dir)
+
+    restored_db = extract_dir / database_members[0]
+    validate_database(restored_db)
+    return restored_db
 
 
 def restore_state_backup(backup_path: Path, database_path: Path) -> RestoreResult:
@@ -106,14 +146,7 @@ def restore_state_backup(backup_path: Path, database_path: Path) -> RestoreResul
 
     with tempfile.TemporaryDirectory(prefix="queue-bot-restore-") as temp_dir:
         extract_dir = Path(temp_dir)
-        with zipfile.ZipFile(archive_path) as archive:
-            database_members = [name for name in archive.namelist() if name.endswith(".sqlite3")]
-            if len(database_members) != 1:
-                raise ValueError("Backup archive must contain exactly one .sqlite3 file.")
-            archive.extract(database_members[0], path=extract_dir)
-
-        restored_db = extract_dir / database_members[0]
-        validate_database(restored_db)
+        restored_db = _extract_backup_database(archive_path, extract_dir)
 
         target.parent.mkdir(parents=True, exist_ok=True)
         safety_copy: Path | None = None
@@ -124,3 +157,37 @@ def restore_state_backup(backup_path: Path, database_path: Path) -> RestoreResul
 
         shutil.copy2(restored_db, target)
         return RestoreResult(database_path=target, safety_copy_path=safety_copy)
+
+
+def restore_latest_backup_if_needed(
+    database_path: Path,
+    backup_path: Path,
+    restore_if_empty: bool = True,
+) -> AutoRestoreResult | None:
+    target = database_path.expanduser().resolve()
+    archive_path = backup_path.expanduser().resolve()
+    if not archive_path.exists():
+        return None
+
+    reason = ""
+    if not target.exists():
+        reason = "database_missing"
+    elif not database_has_schema(target):
+        reason = "database_invalid"
+    elif restore_if_empty and media_item_count(target) == 0:
+        with tempfile.TemporaryDirectory(prefix="queue-bot-autorestore-check-") as temp_dir:
+            backup_db = _extract_backup_database(archive_path, Path(temp_dir))
+            if media_item_count(backup_db) > 0:
+                reason = "database_empty"
+
+    if not reason:
+        return None
+
+    result = restore_state_backup(archive_path, target)
+    return AutoRestoreResult(
+        restored=True,
+        reason=reason,
+        database_path=result.database_path,
+        backup_path=archive_path,
+        safety_copy_path=result.safety_copy_path,
+    )

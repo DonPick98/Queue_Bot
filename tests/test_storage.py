@@ -32,6 +32,9 @@ class StoreTests(unittest.TestCase):
                 default_backup_after_publish_enabled=True,
                 default_backup_after_publish_send_telegram=False,
                 default_backup_after_publish_path="./state_backups/latest-state.zip",
+                backup_auto_restore_enabled=True,
+                backup_auto_restore_if_empty=True,
+                backup_before_shutdown_enabled=True,
             )
         )
         return store
