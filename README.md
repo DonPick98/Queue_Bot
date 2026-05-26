@@ -36,6 +36,9 @@ DEFAULT_TIMEZONE=Europe/Rome
 DEFAULT_POSTING_WINDOWS=all
 AUTO_BACKUP_ENABLED=false
 AUTO_BACKUP_INTERVAL_MINUTES=1440
+BACKUP_AFTER_PUBLISH_ENABLED=true
+BACKUP_AFTER_PUBLISH_SEND_TELEGRAM=false
+BACKUP_AFTER_PUBLISH_PATH=./state_backups/latest-state.zip
 DATABASE_PATH=./data/bot.sqlite3
 ```
 
@@ -127,6 +130,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 - `/post_all CONFIRM`: comando di emergenza, pubblica tutta la coda come post singoli e la svuota.
 - `/set_auto_backup 24h`: invia automaticamente un backup zip agli admin ogni 24 ore.
 - `/set_auto_backup off`: spegne il backup automatico.
+- `/set_publish_backup local`: dopo ogni post sovrascrive un backup rolling locale.
+- `/set_publish_backup telegram`: dopo ogni post crea il backup e lo invia agli admin.
+- `/set_publish_backup off`: spegne il backup dopo pubblicazione.
 - `/pause`: ferma la pubblicazione automatica.
 - `/resume`: riattiva la pubblicazione automatica.
 - `/remove ID`: rimuove un contenuto dalla coda.

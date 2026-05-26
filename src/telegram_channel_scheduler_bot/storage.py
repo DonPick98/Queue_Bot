@@ -128,6 +128,11 @@ class Store:
             "auto_backup_enabled": "true" if config.default_auto_backup_enabled else "false",
             "auto_backup_interval_minutes": str(config.default_auto_backup_interval_minutes),
             "backup_alert_active": "false",
+            "backup_after_publish_enabled": "true" if config.default_backup_after_publish_enabled else "false",
+            "backup_after_publish_send_telegram": "true"
+            if config.default_backup_after_publish_send_telegram
+            else "false",
+            "backup_after_publish_path": config.default_backup_after_publish_path,
         }
         if config.channel_id:
             defaults["channel_id"] = config.channel_id

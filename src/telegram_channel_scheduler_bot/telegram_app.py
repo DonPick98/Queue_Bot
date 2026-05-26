@@ -44,7 +44,7 @@ from .scheduling import (
     parse_posting_windows,
     validate_timezone,
 )
-from .state_archive import create_state_backup, restore_state_backup
+from .state_archive import create_rolling_state_backup, create_state_backup, restore_state_backup
 from .storage import AddMediaResult, MediaItem, Store
 
 
@@ -387,6 +387,7 @@ def build_help_text() -> str:
         "/set_queue_order chronological - usa ordine di arrivo\n"
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
         "/set_auto_backup 24h - backup automatico via Telegram\n"
+        "/set_publish_backup telegram - backup dopo ogni post\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
         "/post_all CONFIRM - pubblica tutta la coda per svuotarla\n"
         f"Alert coda: ti avviso se non copre le prossime {QUEUE_ALERT_HOURS} ore\n"
@@ -492,6 +493,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     timezone_name = get_timezone_name(store)
     posting_windows = get_posting_windows(store)
     auto_backup = store.get_bool_setting("auto_backup_enabled")
+    publish_backup = "spento"
+    if store.get_bool_setting("backup_after_publish_enabled", True):
+        publish_backup = "telegram" if store.get_bool_setting("backup_after_publish_send_telegram") else "locale"
 
     await update.effective_message.reply_text(
         "\n".join(
@@ -505,6 +509,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Post per ciclo: {batch_description}",
                 f"Ordine coda: {queue_order}",
                 f"Auto-backup: {'attivo' if auto_backup else 'spento'}",
+                f"Backup dopo post: {publish_backup}",
                 f"Copertura {QUEUE_ALERT_HOURS}h: {format_coverage_status(coverage)}",
                 f"Rapporto foto/video: {photo_ratio}:{video_ratio}",
                 f"Coda: {queued[PHOTO]} foto, {queued[VIDEO]} video",
@@ -521,6 +526,9 @@ def build_dashboard_text(store: Store) -> str:
     next_publish_at = get_or_initialize_next_publish_at(store)
     timezone_name = get_timezone_name(store)
     paused = store.get_bool_setting("paused")
+    publish_backup = "spento"
+    if store.get_bool_setting("backup_after_publish_enabled", True):
+        publish_backup = "telegram" if store.get_bool_setting("backup_after_publish_send_telegram") else "locale"
     return "\n".join(
         [
             "Queue Bot Dashboard",
@@ -536,6 +544,7 @@ def build_dashboard_text(store: Store) -> str:
             f"Ratio: {store.get_int_setting('photo_ratio', 1)}:{store.get_int_setting('video_ratio', 1)}",
             f"Copertura 24h: {format_coverage_status(coverage)}",
             f"Auto-backup: {'attivo' if store.get_bool_setting('auto_backup_enabled') else 'spento'}",
+            f"Backup dopo post: {publish_backup}",
         ]
     )
 
@@ -605,6 +614,11 @@ def dashboard_keyboard(store: Store, view: str = "main") -> InlineKeyboardMarkup
                     InlineKeyboardButton("Auto off", callback_data="dash:autobackup:off"),
                     InlineKeyboardButton("Indietro", callback_data="dash:main"),
                 ],
+                [
+                    InlineKeyboardButton("Dopo post: locale", callback_data="dash:publishbackup:local"),
+                    InlineKeyboardButton("Dopo post: Telegram", callback_data="dash:publishbackup:telegram"),
+                ],
+                [InlineKeyboardButton("Dopo post: off", callback_data="dash:publishbackup:off")],
             ]
         )
     return InlineKeyboardMarkup(
@@ -679,6 +693,11 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "dash:post1":
         outcomes = await publish_many(context.application, count=1, manual=True)
         note = format_publish_outcomes(outcomes)
+        if any(outcome.status == "published" for outcome in outcomes):
+            try:
+                await create_backup_after_publish(context.application)
+            except Exception:
+                LOGGER.exception("Post-publish backup failed")
         await check_queue_coverage_alert(context.application, notify=True)
     elif data == "dash:backupnow":
         await send_state_backup(context.application, query.message.chat_id, prefix="Backup")
@@ -754,6 +773,21 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             store.set_setting("next_backup_at", datetime_to_setting(utcnow() + timedelta(minutes=interval)))
             note = f"Auto-backup ogni {format_duration(interval)}."
         schedule_auto_backup(context.application, store)
+        view = "backup"
+    elif data.startswith("dash:publishbackup:"):
+        raw = data.rsplit(":", 1)[-1]
+        if raw == "off":
+            store.set_setting("backup_after_publish_enabled", "false")
+            store.set_setting("backup_after_publish_send_telegram", "false")
+            note = "Backup dopo pubblicazione spento."
+        elif raw == "telegram":
+            store.set_setting("backup_after_publish_enabled", "true")
+            store.set_setting("backup_after_publish_send_telegram", "true")
+            note = "Backup dopo pubblicazione: locale + invio Telegram."
+        else:
+            store.set_setting("backup_after_publish_enabled", "true")
+            store.set_setting("backup_after_publish_send_telegram", "false")
+            note = "Backup dopo pubblicazione: file locale rolling."
         view = "backup"
 
     await send_or_edit_dashboard(update, context, view=view, note=note)
@@ -1034,6 +1068,11 @@ async def post_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     outcomes = await publish_many(context.application, count=count, manual=True)
+    if any(outcome.status == "published" for outcome in outcomes):
+        try:
+            await create_backup_after_publish(context.application)
+        except Exception:
+            LOGGER.exception("Post-publish backup failed")
     await update.effective_message.reply_text(format_publish_outcomes(outcomes))
     await check_queue_coverage_alert(context.application, notify=True)
 
@@ -1063,6 +1102,11 @@ async def post_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Ok, pubblico tutta la coda: {total} media. Potrebbe volerci qualche minuto."
     )
     outcomes = await publish_many(context.application, count=total, manual=True)
+    if any(outcome.status == "published" for outcome in outcomes):
+        try:
+            await create_backup_after_publish(context.application)
+        except Exception:
+            LOGGER.exception("Post-publish backup failed")
     await update.effective_message.reply_text(format_publish_summary(outcomes, requested=total))
     await check_queue_coverage_alert(context.application, notify=True)
 
@@ -1112,12 +1156,88 @@ async def send_state_backup(application: Application, chat_id: int | str, prefix
     return True
 
 
+async def create_backup_after_publish(application: Application) -> None:
+    store = get_store(application)
+    if not store.get_bool_setting("backup_after_publish_enabled", True):
+        return
+
+    raw_path = store.get_setting("backup_after_publish_path", "./state_backups/latest-state.zip")
+    backup_path = create_rolling_state_backup(store.path, Path(raw_path or "./state_backups/latest-state.zip"))
+    LOGGER.info("Rolling post-publish backup written to %s", backup_path)
+
+    if not store.get_bool_setting("backup_after_publish_send_telegram"):
+        return
+
+    admin_ids = store.get_admin_ids()
+    for admin_id in admin_ids:
+        try:
+            with backup_path.open("rb") as backup_file:
+                await application.bot.send_document(
+                    chat_id=admin_id,
+                    document=backup_file,
+                    filename=backup_path.name,
+                    caption=(
+                        "Backup automatico dopo pubblicazione. "
+                        "Contiene coda, impostazioni, deduplica e prossimo orario."
+                    ),
+                )
+        except TelegramError:
+            LOGGER.exception("Failed to send post-publish backup to admin %s", admin_id)
+
+
 async def backup_state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
 
     await update.effective_message.reply_text("Creo backup dello stato del bot...")
     await send_state_backup(context.application, update.effective_chat.id, prefix="Backup")
+
+
+async def set_publish_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    if not context.args:
+        enabled = store.get_bool_setting("backup_after_publish_enabled", True)
+        send_telegram = store.get_bool_setting("backup_after_publish_send_telegram")
+        path = store.get_setting("backup_after_publish_path", "./state_backups/latest-state.zip")
+        mode = "spento"
+        if enabled:
+            mode = "telegram" if send_telegram else "locale"
+        await update.effective_message.reply_text(
+            "Uso: /set_publish_backup local, /set_publish_backup telegram oppure /set_publish_backup off\n"
+            f"Adesso: {mode}\n"
+            f"File locale: {path}"
+        )
+        return
+
+    value = context.args[0].strip().lower()
+    if value in {"off", "false", "no", "0", "spento"}:
+        store.set_setting("backup_after_publish_enabled", "false")
+        store.set_setting("backup_after_publish_send_telegram", "false")
+        await update.effective_message.reply_text("Backup dopo pubblicazione spento.")
+        return
+
+    if value in {"telegram", "tg", "send"}:
+        store.set_setting("backup_after_publish_enabled", "true")
+        store.set_setting("backup_after_publish_send_telegram", "true")
+        await update.effective_message.reply_text(
+            "Backup dopo pubblicazione attivo: creo il file rolling locale e lo invio agli admin su Telegram."
+        )
+        return
+
+    if value in {"local", "locale", "on", "true", "yes", "1"}:
+        store.set_setting("backup_after_publish_enabled", "true")
+        store.set_setting("backup_after_publish_send_telegram", "false")
+        await update.effective_message.reply_text(
+            "Backup dopo pubblicazione attivo: sovrascrivo il file locale latest-state.zip."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Uso: /set_publish_backup local, /set_publish_backup telegram oppure /set_publish_backup off"
+    )
 
 
 async def set_auto_backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1435,6 +1555,7 @@ async def check_queue_coverage_alert(application: Application, notify: bool = Tr
 async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     store = get_store(context)
     advance_after_run = True
+    outcomes: list[PublishOutcome] = []
     try:
         now = utcnow()
         if not is_within_posting_windows(now, get_timezone_name(store), get_posting_windows(store)):
@@ -1457,6 +1578,11 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if advance_after_run:
             next_publish_at = set_next_publish_after_interval(store)
             LOGGER.info("Next publish scheduled at %s", datetime_to_setting(next_publish_at))
+        if any(outcome.status == "published" for outcome in outcomes):
+            try:
+                await create_backup_after_publish(context.application)
+            except Exception:
+                LOGGER.exception("Post-publish backup failed")
         schedule_publisher(context.application, store)
 
 
@@ -1562,6 +1688,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler(["set_queue_order", "set_order"], set_queue_order_command))
     application.add_handler(CommandHandler("set_ratio", set_ratio_command))
     application.add_handler(CommandHandler("set_auto_backup", set_auto_backup_command))
+    application.add_handler(CommandHandler("set_publish_backup", set_publish_backup_command))
     application.add_handler(CommandHandler("pause", pause_command))
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("post_now", post_now_command))

@@ -29,6 +29,9 @@ class StoreTests(unittest.TestCase):
                 default_posting_windows="all",
                 default_auto_backup_enabled=False,
                 default_auto_backup_interval_minutes=24 * 60,
+                default_backup_after_publish_enabled=True,
+                default_backup_after_publish_send_telegram=False,
+                default_backup_after_publish_path="./state_backups/latest-state.zip",
             )
         )
         return store

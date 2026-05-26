@@ -57,6 +57,35 @@ def create_state_backup(database_path: Path, output_dir: Path) -> Path:
     return archive_path
 
 
+def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path:
+    source = database_path.expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Database not found: {source}")
+
+    target = archive_path.expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    with tempfile.TemporaryDirectory(prefix="queue-bot-rolling-backup-") as temp_dir:
+        temp_path = Path(temp_dir)
+        work_db = temp_path / f"queue-bot-state-{timestamp}.sqlite3"
+        temp_archive = temp_path / target.name
+        backup_database(source, work_db)
+        manifest = {
+            "app": "queue-bot",
+            "created_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            "database_file": work_db.name,
+            "source_database": str(source),
+            "rolling_backup": True,
+        }
+        with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(work_db, arcname=work_db.name)
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
+        shutil.copy2(temp_archive, target)
+
+    return target
+
+
 def validate_database(database_path: Path) -> None:
     connection = sqlite3.connect(database_path)
     try:

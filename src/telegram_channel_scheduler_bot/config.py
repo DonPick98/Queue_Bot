@@ -88,6 +88,9 @@ class AppConfig:
     default_posting_windows: str
     default_auto_backup_enabled: bool
     default_auto_backup_interval_minutes: int
+    default_backup_after_publish_enabled: bool
+    default_backup_after_publish_send_telegram: bool
+    default_backup_after_publish_path: str
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -113,4 +116,11 @@ class AppConfig:
             default_posting_windows=_posting_windows("DEFAULT_POSTING_WINDOWS", DEFAULT_POSTING_WINDOWS),
             default_auto_backup_enabled=_bool("AUTO_BACKUP_ENABLED", False),
             default_auto_backup_interval_minutes=_positive_int("AUTO_BACKUP_INTERVAL_MINUTES", 24 * 60),
+            default_backup_after_publish_enabled=_bool("BACKUP_AFTER_PUBLISH_ENABLED", True),
+            default_backup_after_publish_send_telegram=_bool("BACKUP_AFTER_PUBLISH_SEND_TELEGRAM", False),
+            default_backup_after_publish_path=os.getenv(
+                "BACKUP_AFTER_PUBLISH_PATH",
+                "./state_backups/latest-state.zip",
+            ).strip()
+            or "./state_backups/latest-state.zip",
         )

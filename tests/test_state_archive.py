@@ -2,7 +2,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from telegram_channel_scheduler_bot.state_archive import create_state_backup, restore_state_backup
+from telegram_channel_scheduler_bot.state_archive import (
+    create_rolling_state_backup,
+    create_state_backup,
+    restore_state_backup,
+)
 from telegram_channel_scheduler_bot.storage import Store
 
 
@@ -47,6 +51,27 @@ class StateArchiveTests(unittest.TestCase):
             self.assertIsNotNone(result.safety_copy_path)
             self.assertTrue(result.safety_copy_path.exists())
             self.assertEqual(Store(target_database).queued_counts_by_type()["video"], 1)
+
+    def test_create_rolling_state_backup_overwrites_same_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "source.sqlite3"
+            archive = root / "latest-state.zip"
+
+            store = Store(database)
+            store.initialize()
+            store.add_media("photo", "file-1", "unique-1", None, 123)
+
+            first = create_rolling_state_backup(database, archive)
+            first_mtime = first.stat().st_mtime_ns
+
+            store.add_media("video", "file-2", "unique-2", None, 123)
+            second = create_rolling_state_backup(database, archive)
+
+            self.assertEqual(first, second)
+            self.assertTrue(second.exists())
+            self.assertGreater(second.stat().st_size, 0)
+            self.assertGreaterEqual(second.stat().st_mtime_ns, first_mtime)
 
 
 if __name__ == "__main__":
