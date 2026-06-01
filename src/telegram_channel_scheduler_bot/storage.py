@@ -414,6 +414,31 @@ class Store:
             ).fetchall()
         return [self._row_to_media_item(row) for row in rows]
 
+    def list_published_photos(self, limit: int = 3, exclude_ids: Iterable[int] = ()) -> list[MediaItem]:
+        excluded = tuple(dict.fromkeys(int(media_id) for media_id in exclude_ids))
+        params: list[object] = [PUBLISHED, PHOTO]
+        exclude_clause = ""
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            exclude_clause = f"AND id NOT IN ({placeholders})"
+            params.extend(excluded)
+        params.append(limit)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM media_items
+                WHERE status = ?
+                  AND media_type = ?
+                  {exclude_clause}
+                ORDER BY published_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_media_item(row) for row in rows]
+
     def find_media_by_id(self, media_item_id: int) -> MediaItem | None:
         with self.connect() as connection:
             row = connection.execute(

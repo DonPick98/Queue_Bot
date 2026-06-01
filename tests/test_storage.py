@@ -77,6 +77,31 @@ class StoreTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertGreaterEqual(second, first)
 
+    def test_list_published_photos_returns_only_published_photos(self):
+        store = self.make_store()
+        first = store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        second = store.add_media("photo", "file-photo-2", "unique-photo-2", None, 123)
+        store.add_media("photo", "file-photo-queued", "unique-photo-queued", None, 123)
+        video = store.add_media("video", "file-video-1", "unique-video-1", None, 123)
+        store.mark_published("unique-photo-1", "photo", source="bot", media_item_id=first.media_item.id)
+        store.mark_published("unique-photo-2", "photo", source="bot", media_item_id=second.media_item.id)
+        store.mark_published("unique-video-1", "video", source="bot", media_item_id=video.media_item.id)
+
+        items = store.list_published_photos(limit=3)
+
+        self.assertEqual([item.file_unique_id for item in items], ["unique-photo-2", "unique-photo-1"])
+
+    def test_list_published_photos_can_exclude_previous_exports(self):
+        store = self.make_store()
+        first = store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        second = store.add_media("photo", "file-photo-2", "unique-photo-2", None, 123)
+        store.mark_published("unique-photo-1", "photo", source="bot", media_item_id=first.media_item.id)
+        store.mark_published("unique-photo-2", "photo", source="bot", media_item_id=second.media_item.id)
+
+        items = store.list_published_photos(limit=3, exclude_ids=[second.media_item.id])
+
+        self.assertEqual([item.file_unique_id for item in items], ["unique-photo-1"])
+
     def test_get_queued_item_chronological_returns_oldest_matching_type(self):
         store = self.make_store()
         store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)

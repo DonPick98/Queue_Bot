@@ -131,6 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_startup_task.ps1
 - `/post_now`: pubblica subito il prossimo contenuto, anche se il bot e in pausa.
 - `/post_now 3`: pubblica subito 3 contenuti, come post singoli separati.
 - `/post_all CONFIRM`: comando di emergenza, pubblica tutta la coda come post singoli e la svuota.
+- `/x`: ricevi in chat 3 foto gia pubblicate, pronte da scaricare e riusare su X.
 - `/set_auto_backup 24h`: invia automaticamente un backup zip agli admin ogni 24 ore.
 - `/set_auto_backup off`: spegne il backup automatico.
 - `/set_publish_backup local`: dopo ogni post sovrascrive un backup rolling locale.

@@ -57,6 +57,8 @@ LOGGER = logging.getLogger(__name__)
 PUBLISH_JOB_NAME = "publisher"
 BACKUP_JOB_NAME = "auto_backup"
 MAX_POSTS_PER_RUN = 20
+X_EXPORT_COUNT = 3
+X_EXPORTED_SETTING = "x_exported_media_item_ids"
 PUBLIC_URL_ENV_KEYS = (
     "PUBLIC_BASE_URL",
     "APP_URL",
@@ -205,6 +207,19 @@ def parse_post_count(raw: str, max_count: int = MAX_POSTS_PER_RUN) -> int:
     if count > max_count:
         raise ValueError(f"Per sicurezza il massimo e {max_count} post per ciclo.")
     return count
+
+
+def parse_media_item_ids(raw: str | None) -> list[int]:
+    ids: list[int] = []
+    for chunk in (raw or "").replace(";", ",").split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        try:
+            ids.append(int(value))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(ids))
 
 
 def resolve_posts_per_run(store: Store, queued_counts: dict[str, int] | None = None) -> int:
@@ -391,6 +406,7 @@ def build_help_text() -> str:
         "/set_queue_order random - pesca casuale dalla coda\n"
         "/set_queue_order chronological - usa ordine di arrivo\n"
         "/set_ratio 1 1 - imposta bilanciamento foto video\n"
+        "/x - ricevi 3 foto gia pubblicate da usare su X\n"
         "/set_auto_backup 24h - backup automatico via Telegram\n"
         "/set_publish_backup telegram - backup dopo ogni post\n"
         "/post_now 3 - pubblica subito uno o piu contenuti\n"
@@ -1116,6 +1132,39 @@ async def post_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await check_queue_coverage_alert(context.application, notify=True)
 
 
+async def x_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+
+    store = get_store(context)
+    exported_ids = parse_media_item_ids(store.get_setting(X_EXPORTED_SETTING, ""))
+    items = store.list_published_photos(limit=X_EXPORT_COUNT, exclude_ids=exported_ids)
+    if len(items) < X_EXPORT_COUNT:
+        fallback = store.list_published_photos(limit=X_EXPORT_COUNT)
+        seen_ids = {item.id for item in items}
+        items.extend(item for item in fallback if item.id not in seen_ids)
+        items = items[:X_EXPORT_COUNT]
+
+    if not items:
+        await update.effective_message.reply_text(
+            "Non ho ancora foto pubblicate da esportare per X. Uso solo contenuti gia usciti sul canale."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"Ti mando {len(items)} foto gia pubblicate per X. I subscriber le hanno gia avute per primi."
+    )
+    for item in items:
+        await context.bot.send_photo(
+            chat_id=update.effective_message.chat_id,
+            photo=item.file_id,
+            caption=f"X export #{item.id}",
+        )
+
+    merged_ids = list(dict.fromkeys(exported_ids + [item.id for item in items]))
+    store.set_setting(X_EXPORTED_SETTING, ",".join(str(media_id) for media_id in merged_ids[-500:]))
+
+
 async def mark_published_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
@@ -1699,6 +1748,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("post_now", post_now_command))
     application.add_handler(CommandHandler("post_all", post_all_command))
+    application.add_handler(CommandHandler("x", x_command))
     application.add_handler(CommandHandler("remove", remove_command))
     application.add_handler(CommandHandler("mark_published", mark_published_command))
     application.add_handler(CommandHandler(["backup_state", "backup"], backup_state_command))
