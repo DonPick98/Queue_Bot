@@ -244,6 +244,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         elif "caption" in form:
             caption = str(form.getfirst("caption") or "")
         content_fingerprint = str(form.getfirst("content_fingerprint") or "").strip() or None
+        try:
+            priority = max(0, int(str(form.getfirst("priority") or "0").strip() or "0"))
+        except ValueError:
+            priority = 0
 
         fields = {"chat_id": staging_chat_id}
         if caption:
@@ -274,6 +278,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             caption_html=caption or None,
             added_by=None,
             content_fingerprint=content_fingerprint,
+            priority=priority,
         )
 
         if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:

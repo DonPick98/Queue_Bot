@@ -35,6 +35,7 @@ class MediaItem:
     failed_attempts: int
     error: str | None
     content_fingerprint: str | None = None
+    priority: int = 0
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,8 @@ class Store:
                     channel_message_id INTEGER,
                     failed_attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
-                    content_fingerprint TEXT
+                    content_fingerprint TEXT,
+                    priority INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS published_media (
@@ -114,6 +116,7 @@ class Store:
                 """
             )
             self._ensure_column(connection, "media_items", "content_fingerprint TEXT")
+            self._ensure_column(connection, "media_items", "priority INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
             connection.execute(
                 """
@@ -231,8 +234,10 @@ class Store:
         caption_html: str | None,
         added_by: int | None,
         content_fingerprint: str | None = None,
+        priority: int = 0,
     ) -> AddMediaResult:
         content_fingerprint = normalize_fingerprint(content_fingerprint)
+        priority = max(0, int(priority or 0))
         if self.is_published(file_unique_id, content_fingerprint):
             return AddMediaResult(status="already_published")
 
@@ -251,9 +256,9 @@ class Store:
                     """
                     INSERT INTO media_items(
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
-                        status, content_fingerprint
+                        status, content_fingerprint, priority
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -264,6 +269,7 @@ class Store:
                         now,
                         QUEUED,
                         content_fingerprint,
+                        priority,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -469,9 +475,9 @@ class Store:
 
     def get_queued_item(self, media_type: str | None = None, order: str = "chronological") -> MediaItem | None:
         if order == "random":
-            order_by = "RANDOM()"
+            order_by = "priority DESC, RANDOM()"
         else:
-            order_by = "added_at ASC, id ASC"
+            order_by = "priority DESC, added_at ASC, id ASC"
 
         if media_type:
             sql = f"""
@@ -503,7 +509,7 @@ class Store:
                 """
                 SELECT * FROM media_items
                 WHERE status = ?
-                ORDER BY added_at ASC, id ASC
+                ORDER BY priority DESC, added_at ASC, id ASC
                 LIMIT ?
                 """,
                 (QUEUED, limit),
@@ -557,6 +563,7 @@ class Store:
             failed_attempts=row["failed_attempts"],
             error=row["error"],
             content_fingerprint=row["content_fingerprint"] if "content_fingerprint" in row.keys() else None,
+            priority=int(row["priority"]) if "priority" in row.keys() else 0,
         )
 
 

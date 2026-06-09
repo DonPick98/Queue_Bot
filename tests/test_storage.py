@@ -129,6 +129,16 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(first_photo.file_unique_id, "unique-photo-1")
 
+    def test_get_queued_item_prefers_priority_within_type(self):
+        store = self.make_store()
+        store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        store.add_media("photo", "file-photo-2", "unique-photo-2", None, 123, priority=100)
+
+        first_photo = store.get_queued_item("photo", order="chronological")
+
+        self.assertEqual(first_photo.file_unique_id, "unique-photo-2")
+        self.assertEqual(first_photo.priority, 100)
+
     def test_get_queued_item_random_respects_requested_type(self):
         store = self.make_store()
         store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
