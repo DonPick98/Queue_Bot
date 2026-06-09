@@ -243,6 +243,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             caption = str(form.getfirst("caption_html") or "")
         elif "caption" in form:
             caption = str(form.getfirst("caption") or "")
+        content_fingerprint = str(form.getfirst("content_fingerprint") or "").strip() or None
 
         fields = {"chat_id": staging_chat_id}
         if caption:
@@ -272,6 +273,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             file_unique_id=telegram_media["file_unique_id"],
             caption_html=caption or None,
             added_by=None,
+            content_fingerprint=content_fingerprint,
         )
 
         if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:

@@ -34,6 +34,7 @@ class MediaItem:
     status: str
     failed_attempts: int
     error: str | None
+    content_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,8 @@ class Store:
                     published_at TEXT,
                     channel_message_id INTEGER,
                     failed_attempts INTEGER NOT NULL DEFAULT 0,
-                    error TEXT
+                    error TEXT,
+                    content_fingerprint TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS published_media (
@@ -90,7 +92,8 @@ class Store:
                     media_type TEXT NOT NULL CHECK (media_type IN ('photo', 'video')),
                     published_at TEXT NOT NULL,
                     source TEXT NOT NULL,
-                    channel_message_id INTEGER
+                    channel_message_id INTEGER,
+                    content_fingerprint TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS publish_log (
@@ -110,6 +113,32 @@ class Store:
                     ON publish_log(id, media_type);
                 """
             )
+            self._ensure_column(connection, "media_items", "content_fingerprint TEXT")
+            self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_media_items_content_fingerprint
+                    ON media_items(content_fingerprint)
+                    WHERE content_fingerprint IS NOT NULL AND content_fingerprint != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_published_media_content_fingerprint
+                    ON published_media(content_fingerprint)
+                    WHERE content_fingerprint IS NOT NULL AND content_fingerprint != ''
+                """
+            )
+
+    @staticmethod
+    def _ensure_column(connection: sqlite3.Connection, table: str, definition: str) -> None:
+        column = definition.split()[0]
+        existing = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     def bootstrap(self, config: AppConfig) -> None:
         defaults = {
@@ -201,27 +230,44 @@ class Store:
         file_unique_id: str,
         caption_html: str | None,
         added_by: int | None,
+        content_fingerprint: str | None = None,
     ) -> AddMediaResult:
-        if self.is_published(file_unique_id):
+        content_fingerprint = normalize_fingerprint(content_fingerprint)
+        if self.is_published(file_unique_id, content_fingerprint):
             return AddMediaResult(status="already_published")
 
         now = utcnow_iso()
         with self.connect() as connection:
+            existing = self._find_existing_media(connection, file_unique_id, content_fingerprint)
+            if existing:
+                item = self._row_to_media_item(existing)
+                return AddMediaResult(
+                    status="duplicate",
+                    media_item=item,
+                    existing_status=item.status,
+                )
             try:
                 cursor = connection.execute(
                     """
                     INSERT INTO media_items(
-                        media_type, file_id, file_unique_id, caption_html, added_by, added_at, status
+                        media_type, file_id, file_unique_id, caption_html, added_by, added_at,
+                        status, content_fingerprint
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (media_type, file_id, file_unique_id, caption_html, added_by, now, QUEUED),
+                    (
+                        media_type,
+                        file_id,
+                        file_unique_id,
+                        caption_html,
+                        added_by,
+                        now,
+                        QUEUED,
+                        content_fingerprint,
+                    ),
                 )
             except sqlite3.IntegrityError:
-                row = connection.execute(
-                    "SELECT * FROM media_items WHERE file_unique_id = ?",
-                    (file_unique_id,),
-                ).fetchone()
+                row = self._find_existing_media(connection, file_unique_id, content_fingerprint)
                 item = self._row_to_media_item(row) if row else None
                 return AddMediaResult(
                     status="duplicate",
@@ -235,12 +281,46 @@ class Store:
             ).fetchone()
             return AddMediaResult(status="queued", media_item=self._row_to_media_item(row))
 
-    def is_published(self, file_unique_id: str) -> bool:
-        with self.connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM published_media WHERE file_unique_id = ?",
-                (file_unique_id,),
+    def _find_existing_media(
+        self,
+        connection: sqlite3.Connection,
+        file_unique_id: str,
+        content_fingerprint: str | None = None,
+    ) -> sqlite3.Row | None:
+        if content_fingerprint:
+            return connection.execute(
+                """
+                SELECT *
+                FROM media_items
+                WHERE file_unique_id = ? OR content_fingerprint = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (file_unique_id, content_fingerprint),
             ).fetchone()
+        return connection.execute(
+            "SELECT * FROM media_items WHERE file_unique_id = ? LIMIT 1",
+            (file_unique_id,),
+        ).fetchone()
+
+    def is_published(self, file_unique_id: str, content_fingerprint: str | None = None) -> bool:
+        content_fingerprint = normalize_fingerprint(content_fingerprint)
+        with self.connect() as connection:
+            if content_fingerprint:
+                row = connection.execute(
+                    """
+                    SELECT 1
+                    FROM published_media
+                    WHERE file_unique_id = ? OR content_fingerprint = ?
+                    LIMIT 1
+                    """,
+                    (file_unique_id, content_fingerprint),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT 1 FROM published_media WHERE file_unique_id = ?",
+                    (file_unique_id,),
+                ).fetchone()
         return row is not None
 
     def mark_published(
@@ -253,23 +333,39 @@ class Store:
     ) -> bool:
         now = utcnow_iso()
         with self.connect() as connection:
+            content_fingerprint = None
+            if media_item_id is not None:
+                item_row = connection.execute(
+                    "SELECT content_fingerprint FROM media_items WHERE id = ?",
+                    (media_item_id,),
+                ).fetchone()
+                if item_row:
+                    content_fingerprint = normalize_fingerprint(item_row["content_fingerprint"])
             existing = connection.execute(
-                "SELECT source FROM published_media WHERE file_unique_id = ?",
-                (file_unique_id,),
+                """
+                SELECT source
+                FROM published_media
+                WHERE file_unique_id = ?
+                   OR (? IS NOT NULL AND content_fingerprint = ?)
+                LIMIT 1
+                """,
+                (file_unique_id, content_fingerprint, content_fingerprint),
             ).fetchone()
             is_new = existing is None
 
             connection.execute(
                 """
                 INSERT INTO published_media(
-                    file_unique_id, media_type, published_at, source, channel_message_id
+                    file_unique_id, media_type, published_at, source, channel_message_id,
+                    content_fingerprint
                 )
-                VALUES(?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_unique_id) DO UPDATE SET
                     media_type = excluded.media_type,
-                    channel_message_id = COALESCE(excluded.channel_message_id, published_media.channel_message_id)
+                    channel_message_id = COALESCE(excluded.channel_message_id, published_media.channel_message_id),
+                    content_fingerprint = COALESCE(excluded.content_fingerprint, published_media.content_fingerprint)
                 """,
-                (file_unique_id, media_type, now, source, channel_message_id),
+                (file_unique_id, media_type, now, source, channel_message_id, content_fingerprint),
             )
             connection.execute(
                 """
@@ -460,4 +556,12 @@ class Store:
             status=row["status"],
             failed_attempts=row["failed_attempts"],
             error=row["error"],
+            content_fingerprint=row["content_fingerprint"] if "content_fingerprint" in row.keys() else None,
         )
+
+
+def normalize_fingerprint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    return normalized or None

@@ -56,6 +56,23 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(result.status, "already_published")
 
+    def test_add_media_rejects_same_content_fingerprint(self):
+        store = self.make_store()
+        first = store.add_media("photo", "file-id-1", "unique-id-1", None, 123, "reddit:abc123")
+        second = store.add_media("photo", "file-id-2", "unique-id-2", None, 123, "reddit:abc123")
+
+        self.assertEqual(first.status, "queued")
+        self.assertEqual(second.status, "duplicate")
+        self.assertEqual(second.media_item.id, first.media_item.id)
+
+    def test_published_content_fingerprint_is_not_queued_again(self):
+        store = self.make_store()
+        first = store.add_media("video", "file-id-1", "unique-id-1", None, 123, "reddit-video:abc123")
+        store.mark_published("unique-id-1", "video", source="bot", media_item_id=first.media_item.id)
+        result = store.add_media("video", "file-id-2", "unique-id-2", None, 123, "reddit-video:abc123")
+
+        self.assertEqual(result.status, "already_published")
+
     def test_mark_published_updates_queued_item(self):
         store = self.make_store()
         result = store.add_media("photo", "file-id", "unique-id", None, 123)
