@@ -36,6 +36,9 @@ class MediaItem:
     error: str | None
     content_fingerprint: str | None = None
     priority: int = 0
+    video_width: int | None = None
+    video_height: int | None = None
+    video_duration: int | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +89,10 @@ class Store:
                     failed_attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     content_fingerprint TEXT,
-                    priority INTEGER NOT NULL DEFAULT 0
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    video_width INTEGER,
+                    video_height INTEGER,
+                    video_duration INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS published_media (
@@ -117,6 +123,9 @@ class Store:
             )
             self._ensure_column(connection, "media_items", "content_fingerprint TEXT")
             self._ensure_column(connection, "media_items", "priority INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "media_items", "video_width INTEGER")
+            self._ensure_column(connection, "media_items", "video_height INTEGER")
+            self._ensure_column(connection, "media_items", "video_duration INTEGER")
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
             connection.execute(
                 """
@@ -235,9 +244,15 @@ class Store:
         added_by: int | None,
         content_fingerprint: str | None = None,
         priority: int = 0,
+        video_width: int | None = None,
+        video_height: int | None = None,
+        video_duration: int | None = None,
     ) -> AddMediaResult:
         content_fingerprint = normalize_fingerprint(content_fingerprint)
         priority = max(0, int(priority or 0))
+        video_width = normalize_positive_int(video_width)
+        video_height = normalize_positive_int(video_height)
+        video_duration = normalize_positive_int(video_duration)
         if self.is_published(file_unique_id, content_fingerprint):
             return AddMediaResult(status="already_published")
 
@@ -256,9 +271,9 @@ class Store:
                     """
                     INSERT INTO media_items(
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
-                        status, content_fingerprint, priority
+                        status, content_fingerprint, priority, video_width, video_height, video_duration
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -270,6 +285,9 @@ class Store:
                         QUEUED,
                         content_fingerprint,
                         priority,
+                        video_width,
+                        video_height,
+                        video_duration,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -564,6 +582,9 @@ class Store:
             error=row["error"],
             content_fingerprint=row["content_fingerprint"] if "content_fingerprint" in row.keys() else None,
             priority=int(row["priority"]) if "priority" in row.keys() else 0,
+            video_width=optional_int(row, "video_width"),
+            video_height=optional_int(row, "video_height"),
+            video_duration=optional_int(row, "video_duration"),
         )
 
 
@@ -572,3 +593,19 @@ def normalize_fingerprint(value: str | None) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized or None
+
+
+def normalize_positive_int(value: int | str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
+
+
+def optional_int(row: sqlite3.Row, key: str) -> int | None:
+    if key not in row.keys() or row[key] is None:
+        return None
+    return normalize_positive_int(row[key])

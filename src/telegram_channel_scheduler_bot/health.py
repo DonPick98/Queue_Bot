@@ -268,8 +268,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         message = telegram_response["result"]
         if media_type == PHOTO:
             telegram_media = message["photo"][-1]
+            video_width = None
+            video_height = None
+            video_duration = None
         else:
             telegram_media = message["video"]
+            video_width = telegram_media.get("width")
+            video_height = telegram_media.get("height")
+            video_duration = telegram_media.get("duration")
 
         add_result = self.store.add_media(
             media_type=media_type,
@@ -279,6 +285,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             added_by=None,
             content_fingerprint=content_fingerprint,
             priority=priority,
+            video_width=video_width,
+            video_height=video_height,
+            video_duration=video_duration,
         )
 
         if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:

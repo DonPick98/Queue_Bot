@@ -77,6 +77,9 @@ class ExtractedMedia:
     file_id: str
     file_unique_id: str
     caption_html: str | None
+    video_width: int | None = None
+    video_height: int | None = None
+    video_duration: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,9 @@ def extract_media(message: Message) -> ExtractedMedia | None:
             file_id=video.file_id,
             file_unique_id=video.file_unique_id,
             caption_html=message.caption_html if message.caption else None,
+            video_width=video.width,
+            video_height=video.height,
+            video_duration=video.duration,
         )
     return None
 
@@ -1443,6 +1449,9 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         media.file_unique_id,
         media.caption_html,
         update.effective_user.id if update.effective_user else None,
+        video_width=media.video_width,
+        video_height=media.video_height,
+        video_duration=media.video_duration,
     )
     await message.reply_text(format_add_result(result))
     await check_queue_coverage_alert(context.application, notify=False)
@@ -1489,6 +1498,10 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
                 video=item.file_id,
                 caption=item.caption_html,
                 parse_mode=ParseMode.HTML if item.caption_html else None,
+                width=item.video_width,
+                height=item.video_height,
+                duration=item.video_duration,
+                supports_streaming=True,
             )
     except TelegramError as exc:
         store.mark_failed(item.id, str(exc))

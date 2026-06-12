@@ -73,6 +73,23 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(result.status, "already_published")
 
+    def test_add_media_stores_video_metadata(self):
+        store = self.make_store()
+        result = store.add_media(
+            "video",
+            "file-video",
+            "unique-video",
+            None,
+            123,
+            video_width=1920,
+            video_height=1080,
+            video_duration=12,
+        )
+
+        self.assertEqual(result.media_item.video_width, 1920)
+        self.assertEqual(result.media_item.video_height, 1080)
+        self.assertEqual(result.media_item.video_duration, 12)
+
     def test_mark_published_updates_queued_item(self):
         store = self.make_store()
         result = store.add_media("photo", "file-id", "unique-id", None, 123)
