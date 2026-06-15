@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cgi
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -244,6 +245,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         elif "caption" in form:
             caption = str(form.getfirst("caption") or "")
         content_fingerprint = str(form.getfirst("content_fingerprint") or "").strip() or None
+        content_hash = str(form.getfirst("content_hash") or "").strip() or hashlib.sha256(content).hexdigest()
+        visual_hash = str(form.getfirst("visual_hash") or "").strip() or None
         try:
             priority = max(0, int(str(form.getfirst("priority") or "0").strip() or "0"))
         except ValueError:
@@ -284,6 +287,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             caption_html=caption or None,
             added_by=None,
             content_fingerprint=content_fingerprint,
+            content_hash=content_hash,
+            visual_hash=visual_hash,
             priority=priority,
             video_width=video_width,
             video_height=video_height,

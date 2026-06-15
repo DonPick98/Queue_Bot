@@ -1,6 +1,7 @@
+from contextlib import suppress
 from pathlib import Path
-import tempfile
 import unittest
+from uuid import uuid4
 
 from telegram_channel_scheduler_bot.config import AppConfig
 from telegram_channel_scheduler_bot.storage import PUBLISHED, QUEUED, Store
@@ -8,14 +9,17 @@ from telegram_channel_scheduler_bot.storage import PUBLISHED, QUEUED, Store
 
 class StoreTests(unittest.TestCase):
     def make_store(self):
-        tempdir = tempfile.TemporaryDirectory()
-        self.addCleanup(tempdir.cleanup)
-        store = Store(Path(tempdir.name) / "bot.sqlite3")
+        temp_root = Path(__file__).resolve().parents[1] / ".tmp"
+        temp_root.mkdir(exist_ok=True)
+        database_path = temp_root / f"test-{uuid4().hex}.sqlite3"
+        self.addCleanup(self.unlink_if_possible, database_path)
+        self.addCleanup(self.unlink_if_possible, database_path.with_suffix(".sqlite3-journal"))
+        store = Store(database_path)
         store.initialize()
         store.bootstrap(
             AppConfig(
                 bot_token="token",
-                database_path=Path(tempdir.name) / "bot.sqlite3",
+                database_path=database_path,
                 channel_id="@channel",
                 admin_user_ids=(123,),
                 default_interval_minutes=60,
@@ -38,6 +42,11 @@ class StoreTests(unittest.TestCase):
             )
         )
         return store
+
+    @staticmethod
+    def unlink_if_possible(path: Path) -> None:
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
 
     def test_add_media_rejects_duplicate_queue_item(self):
         store = self.make_store()
@@ -65,11 +74,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(second.status, "duplicate")
         self.assertEqual(second.media_item.id, first.media_item.id)
 
+    def test_add_media_rejects_same_content_hash(self):
+        store = self.make_store()
+        first = store.add_media("video", "file-id-1", "unique-id-1", None, 123, content_hash="abc123")
+        second = store.add_media("video", "file-id-2", "unique-id-2", None, 123, content_hash="abc123")
+
+        self.assertEqual(first.status, "queued")
+        self.assertEqual(second.status, "duplicate")
+        self.assertEqual(second.media_item.id, first.media_item.id)
+
+    def test_add_media_rejects_same_photo_visual_hash(self):
+        store = self.make_store()
+        first = store.add_media("photo", "file-id-1", "unique-id-1", None, 123, visual_hash="ff00aa")
+        second = store.add_media("photo", "file-id-2", "unique-id-2", None, 123, visual_hash="ff00aa")
+
+        self.assertEqual(first.status, "queued")
+        self.assertEqual(second.status, "duplicate")
+        self.assertEqual(second.media_item.id, first.media_item.id)
+
     def test_published_content_fingerprint_is_not_queued_again(self):
         store = self.make_store()
         first = store.add_media("video", "file-id-1", "unique-id-1", None, 123, "reddit-video:abc123")
         store.mark_published("unique-id-1", "video", source="bot", media_item_id=first.media_item.id)
         result = store.add_media("video", "file-id-2", "unique-id-2", None, 123, "reddit-video:abc123")
+
+        self.assertEqual(result.status, "already_published")
+
+    def test_published_content_hash_is_not_queued_again(self):
+        store = self.make_store()
+        first = store.add_media("video", "file-id-1", "unique-id-1", None, 123, content_hash="abc123")
+        store.mark_published("unique-id-1", "video", source="bot", media_item_id=first.media_item.id)
+        result = store.add_media("video", "file-id-2", "unique-id-2", None, 123, content_hash="abc123")
 
         self.assertEqual(result.status, "already_published")
 
@@ -164,6 +199,15 @@ class StoreTests(unittest.TestCase):
         item = store.get_queued_item("video", order="random")
 
         self.assertEqual(item.media_type, "video")
+
+    def test_get_queued_item_can_exclude_failed_candidate(self):
+        store = self.make_store()
+        first = store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)
+        store.add_media("photo", "file-photo-2", "unique-photo-2", None, 123)
+
+        item = store.get_queued_item("photo", order="chronological", exclude_ids=[first.media_item.id])
+
+        self.assertEqual(item.file_unique_id, "unique-photo-2")
 
 
 if __name__ == "__main__":

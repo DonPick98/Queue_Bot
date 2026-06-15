@@ -57,6 +57,7 @@ LOGGER = logging.getLogger(__name__)
 PUBLISH_JOB_NAME = "publisher"
 BACKUP_JOB_NAME = "auto_backup"
 MAX_POSTS_PER_RUN = 20
+MAX_PUBLISH_CANDIDATE_ATTEMPTS = 25
 X_EXPORT_COUNT = 3
 X_EXPORTED_SETTING = "x_exported_media_item_ids"
 PUBLIC_URL_ENV_KEYS = (
@@ -1480,51 +1481,74 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
         return PublishOutcome(status="empty", message="La coda e vuota.")
 
     queue_order = store.get_setting("queue_order", "random") or "random"
-    item = store.get_queued_item(media_type, order=queue_order) or store.get_queued_item(order=queue_order)
-    if item is None:
-        return PublishOutcome(status="empty", message="La coda e vuota.")
+    excluded_ids: list[int] = []
+    failures: list[str] = []
+    max_attempts = max(1, min(sum(queued.values()), MAX_PUBLISH_CANDIDATE_ATTEMPTS))
+    for _ in range(max_attempts):
+        item = store.get_queued_item(media_type, order=queue_order, exclude_ids=excluded_ids)
+        if item is None:
+            item = store.get_queued_item(order=queue_order, exclude_ids=excluded_ids)
+        if item is None:
+            break
 
-    try:
-        if item.media_type == PHOTO:
-            sent_message = await application.bot.send_photo(
-                chat_id=channel_id,
-                photo=item.file_id,
-                caption=item.caption_html,
-                parse_mode=ParseMode.HTML if item.caption_html else None,
+        try:
+            if item.media_type == PHOTO:
+                sent_message = await application.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=item.file_id,
+                    caption=item.caption_html,
+                    parse_mode=ParseMode.HTML if item.caption_html else None,
+                )
+            else:
+                sent_message = await application.bot.send_video(
+                    chat_id=channel_id,
+                    video=item.file_id,
+                    caption=item.caption_html,
+                    parse_mode=ParseMode.HTML if item.caption_html else None,
+                    width=item.video_width,
+                    height=item.video_height,
+                    duration=item.video_duration,
+                    supports_streaming=True,
+                )
+        except TelegramError as exc:
+            store.mark_failed(item.id, str(exc))
+            excluded_ids.append(item.id)
+            failures.append(f"#{item.id}: {exc}")
+            LOGGER.warning("Failed to publish media item %s; trying next queued item", item.id, exc_info=True)
+            continue
+
+        store.mark_published(
+            item.file_unique_id,
+            item.media_type,
+            source="bot",
+            channel_message_id=sent_message.message_id,
+            media_item_id=item.id,
+        )
+        store.set_setting("last_published_type", item.media_type)
+        if failures:
+            return PublishOutcome(
+                status="published",
+                media_item=item,
+                message=(
+                    f"Pubblicato #{item.id} ({item.media_type}) sul canale "
+                    f"dopo aver saltato {len(failures)} media falliti."
+                ),
             )
-        else:
-            sent_message = await application.bot.send_video(
-                chat_id=channel_id,
-                video=item.file_id,
-                caption=item.caption_html,
-                parse_mode=ParseMode.HTML if item.caption_html else None,
-                width=item.video_width,
-                height=item.video_height,
-                duration=item.video_duration,
-                supports_streaming=True,
-            )
-    except TelegramError as exc:
-        store.mark_failed(item.id, str(exc))
-        LOGGER.exception("Failed to publish media item %s", item.id)
         return PublishOutcome(
-            status="failed",
+            status="published",
             media_item=item,
-            message=f"Pubblicazione fallita per #{item.id}: {exc}",
+            message=f"Pubblicato #{item.id} ({item.media_type}) sul canale.",
         )
 
-    store.mark_published(
-        item.file_unique_id,
-        item.media_type,
-        source="bot",
-        channel_message_id=sent_message.message_id,
-        media_item_id=item.id,
-    )
-    store.set_setting("last_published_type", item.media_type)
-    return PublishOutcome(
-        status="published",
-        media_item=item,
-        message=f"Pubblicato #{item.id} ({item.media_type}) sul canale.",
-    )
+    if failures:
+        return PublishOutcome(
+            status="failed",
+            message=(
+                "Pubblicazione fallita: non ho trovato un media pubblicabile dopo "
+                f"{len(failures)} tentativi. Ultimo errore: {failures[-1]}"
+            ),
+        )
+    return PublishOutcome(status="empty", message="La coda e vuota.")
 
 
 async def publish_many(application: Application, count: int, manual: bool = False) -> list[PublishOutcome]:

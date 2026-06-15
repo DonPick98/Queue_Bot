@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 import sqlite3
 from typing import Iterable, Iterator
@@ -35,6 +36,8 @@ class MediaItem:
     failed_attempts: int
     error: str | None
     content_fingerprint: str | None = None
+    content_hash: str | None = None
+    visual_hash: str | None = None
     priority: int = 0
     video_width: int | None = None
     video_height: int | None = None
@@ -57,6 +60,9 @@ class Store:
     def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        journal_mode = os.getenv("BOT_SQLITE_JOURNAL_MODE", "").strip().upper()
+        if journal_mode in {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}:
+            connection.execute(f"PRAGMA journal_mode = {journal_mode}")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
@@ -89,6 +95,8 @@ class Store:
                     failed_attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     content_fingerprint TEXT,
+                    content_hash TEXT,
+                    visual_hash TEXT,
                     priority INTEGER NOT NULL DEFAULT 0,
                     video_width INTEGER,
                     video_height INTEGER,
@@ -101,7 +109,9 @@ class Store:
                     published_at TEXT NOT NULL,
                     source TEXT NOT NULL,
                     channel_message_id INTEGER,
-                    content_fingerprint TEXT
+                    content_fingerprint TEXT,
+                    content_hash TEXT,
+                    visual_hash TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS publish_log (
@@ -122,11 +132,15 @@ class Store:
                 """
             )
             self._ensure_column(connection, "media_items", "content_fingerprint TEXT")
+            self._ensure_column(connection, "media_items", "content_hash TEXT")
+            self._ensure_column(connection, "media_items", "visual_hash TEXT")
             self._ensure_column(connection, "media_items", "priority INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "media_items", "video_width INTEGER")
             self._ensure_column(connection, "media_items", "video_height INTEGER")
             self._ensure_column(connection, "media_items", "video_duration INTEGER")
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
+            self._ensure_column(connection, "published_media", "content_hash TEXT")
+            self._ensure_column(connection, "published_media", "visual_hash TEXT")
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_media_items_content_fingerprint
@@ -139,6 +153,34 @@ class Store:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_published_media_content_fingerprint
                     ON published_media(content_fingerprint)
                     WHERE content_fingerprint IS NOT NULL AND content_fingerprint != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_media_items_content_hash
+                    ON media_items(content_hash)
+                    WHERE content_hash IS NOT NULL AND content_hash != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_media_items_visual_hash
+                    ON media_items(media_type, visual_hash)
+                    WHERE visual_hash IS NOT NULL AND visual_hash != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_published_media_content_hash
+                    ON published_media(content_hash)
+                    WHERE content_hash IS NOT NULL AND content_hash != ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_published_media_visual_hash
+                    ON published_media(media_type, visual_hash)
+                    WHERE visual_hash IS NOT NULL AND visual_hash != ''
                 """
             )
 
@@ -243,22 +285,33 @@ class Store:
         caption_html: str | None,
         added_by: int | None,
         content_fingerprint: str | None = None,
+        content_hash: str | None = None,
+        visual_hash: str | None = None,
         priority: int = 0,
         video_width: int | None = None,
         video_height: int | None = None,
         video_duration: int | None = None,
     ) -> AddMediaResult:
         content_fingerprint = normalize_fingerprint(content_fingerprint)
+        content_hash = normalize_hash(content_hash)
+        visual_hash = normalize_hash(visual_hash)
         priority = max(0, int(priority or 0))
         video_width = normalize_positive_int(video_width)
         video_height = normalize_positive_int(video_height)
         video_duration = normalize_positive_int(video_duration)
-        if self.is_published(file_unique_id, content_fingerprint):
+        if self.is_published(media_type, file_unique_id, content_fingerprint, content_hash, visual_hash):
             return AddMediaResult(status="already_published")
 
         now = utcnow_iso()
         with self.connect() as connection:
-            existing = self._find_existing_media(connection, file_unique_id, content_fingerprint)
+            existing = self._find_existing_media(
+                connection,
+                media_type,
+                file_unique_id,
+                content_fingerprint,
+                content_hash,
+                visual_hash,
+            )
             if existing:
                 item = self._row_to_media_item(existing)
                 return AddMediaResult(
@@ -271,9 +324,10 @@ class Store:
                     """
                     INSERT INTO media_items(
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
-                        status, content_fingerprint, priority, video_width, video_height, video_duration
+                        status, content_fingerprint, content_hash, visual_hash, priority,
+                        video_width, video_height, video_duration
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -284,6 +338,8 @@ class Store:
                         now,
                         QUEUED,
                         content_fingerprint,
+                        content_hash,
+                        visual_hash,
                         priority,
                         video_width,
                         video_height,
@@ -291,7 +347,14 @@ class Store:
                     ),
                 )
             except sqlite3.IntegrityError:
-                row = self._find_existing_media(connection, file_unique_id, content_fingerprint)
+                row = self._find_existing_media(
+                    connection,
+                    media_type,
+                    file_unique_id,
+                    content_fingerprint,
+                    content_hash,
+                    visual_hash,
+                )
                 item = self._row_to_media_item(row) if row else None
                 return AddMediaResult(
                     status="duplicate",
@@ -308,43 +371,66 @@ class Store:
     def _find_existing_media(
         self,
         connection: sqlite3.Connection,
+        media_type: str,
         file_unique_id: str,
         content_fingerprint: str | None = None,
+        content_hash: str | None = None,
+        visual_hash: str | None = None,
     ) -> sqlite3.Row | None:
+        clauses = ["file_unique_id = ?"]
+        params: list[object] = [file_unique_id]
         if content_fingerprint:
-            return connection.execute(
-                """
-                SELECT *
-                FROM media_items
-                WHERE file_unique_id = ? OR content_fingerprint = ?
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (file_unique_id, content_fingerprint),
-            ).fetchone()
+            clauses.append("content_fingerprint = ?")
+            params.append(content_fingerprint)
+        if content_hash:
+            clauses.append("content_hash = ?")
+            params.append(content_hash)
+        if visual_hash:
+            clauses.append("(media_type = ? AND visual_hash = ?)")
+            params.extend([media_type, visual_hash])
         return connection.execute(
-            "SELECT * FROM media_items WHERE file_unique_id = ? LIMIT 1",
-            (file_unique_id,),
+            f"""
+            SELECT *
+            FROM media_items
+            WHERE {" OR ".join(clauses)}
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            params,
         ).fetchone()
 
-    def is_published(self, file_unique_id: str, content_fingerprint: str | None = None) -> bool:
+    def is_published(
+        self,
+        media_type: str,
+        file_unique_id: str,
+        content_fingerprint: str | None = None,
+        content_hash: str | None = None,
+        visual_hash: str | None = None,
+    ) -> bool:
         content_fingerprint = normalize_fingerprint(content_fingerprint)
+        content_hash = normalize_hash(content_hash)
+        visual_hash = normalize_hash(visual_hash)
+        clauses = ["file_unique_id = ?"]
+        params: list[object] = [file_unique_id]
+        if content_fingerprint:
+            clauses.append("content_fingerprint = ?")
+            params.append(content_fingerprint)
+        if content_hash:
+            clauses.append("content_hash = ?")
+            params.append(content_hash)
+        if visual_hash:
+            clauses.append("(media_type = ? AND visual_hash = ?)")
+            params.extend([media_type, visual_hash])
         with self.connect() as connection:
-            if content_fingerprint:
-                row = connection.execute(
-                    """
-                    SELECT 1
-                    FROM published_media
-                    WHERE file_unique_id = ? OR content_fingerprint = ?
-                    LIMIT 1
-                    """,
-                    (file_unique_id, content_fingerprint),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT 1 FROM published_media WHERE file_unique_id = ?",
-                    (file_unique_id,),
-                ).fetchone()
+            row = connection.execute(
+                f"""
+                SELECT 1
+                FROM published_media
+                WHERE {" OR ".join(clauses)}
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
         return row is not None
 
     def mark_published(
@@ -358,22 +444,37 @@ class Store:
         now = utcnow_iso()
         with self.connect() as connection:
             content_fingerprint = None
+            content_hash = None
+            visual_hash = None
             if media_item_id is not None:
                 item_row = connection.execute(
-                    "SELECT content_fingerprint FROM media_items WHERE id = ?",
+                    "SELECT content_fingerprint, content_hash, visual_hash FROM media_items WHERE id = ?",
                     (media_item_id,),
                 ).fetchone()
                 if item_row:
                     content_fingerprint = normalize_fingerprint(item_row["content_fingerprint"])
+                    content_hash = normalize_hash(item_row["content_hash"])
+                    visual_hash = normalize_hash(item_row["visual_hash"])
             existing = connection.execute(
                 """
                 SELECT source
                 FROM published_media
                 WHERE file_unique_id = ?
                    OR (? IS NOT NULL AND content_fingerprint = ?)
+                   OR (? IS NOT NULL AND content_hash = ?)
+                   OR (? IS NOT NULL AND media_type = ? AND visual_hash = ?)
                 LIMIT 1
                 """,
-                (file_unique_id, content_fingerprint, content_fingerprint),
+                (
+                    file_unique_id,
+                    content_fingerprint,
+                    content_fingerprint,
+                    content_hash,
+                    content_hash,
+                    visual_hash,
+                    media_type,
+                    visual_hash,
+                ),
             ).fetchone()
             is_new = existing is None
 
@@ -381,15 +482,26 @@ class Store:
                 """
                 INSERT INTO published_media(
                     file_unique_id, media_type, published_at, source, channel_message_id,
-                    content_fingerprint
+                    content_fingerprint, content_hash, visual_hash
                 )
-                VALUES(?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_unique_id) DO UPDATE SET
                     media_type = excluded.media_type,
                     channel_message_id = COALESCE(excluded.channel_message_id, published_media.channel_message_id),
-                    content_fingerprint = COALESCE(excluded.content_fingerprint, published_media.content_fingerprint)
+                    content_fingerprint = COALESCE(excluded.content_fingerprint, published_media.content_fingerprint),
+                    content_hash = COALESCE(excluded.content_hash, published_media.content_hash),
+                    visual_hash = COALESCE(excluded.visual_hash, published_media.visual_hash)
                 """,
-                (file_unique_id, media_type, now, source, channel_message_id, content_fingerprint),
+                (
+                    file_unique_id,
+                    media_type,
+                    now,
+                    source,
+                    channel_message_id,
+                    content_fingerprint,
+                    content_hash,
+                    visual_hash,
+                ),
             )
             connection.execute(
                 """
@@ -491,28 +603,41 @@ class Store:
             ).fetchone()
         return row["published_at"] if row else None
 
-    def get_queued_item(self, media_type: str | None = None, order: str = "chronological") -> MediaItem | None:
+    def get_queued_item(
+        self,
+        media_type: str | None = None,
+        order: str = "chronological",
+        exclude_ids: Iterable[int] | None = None,
+    ) -> MediaItem | None:
         if order == "random":
             order_by = "priority DESC, RANDOM()"
         else:
             order_by = "priority DESC, added_at ASC, id ASC"
 
+        excluded = [int(media_id) for media_id in (exclude_ids or [])]
+        excluded_clause = ""
+        excluded_params: list[object] = []
+        if excluded:
+            placeholders = ", ".join("?" for _ in excluded)
+            excluded_clause = f" AND id NOT IN ({placeholders})"
+            excluded_params.extend(excluded)
+
         if media_type:
             sql = f"""
                 SELECT * FROM media_items
-                WHERE status = ? AND media_type = ?
+                WHERE status = ? AND media_type = ?{excluded_clause}
                 ORDER BY {order_by}
                 LIMIT 1
             """
-            params: tuple[object, ...] = (QUEUED, media_type)
+            params: tuple[object, ...] = (QUEUED, media_type, *excluded_params)
         else:
             sql = f"""
                 SELECT * FROM media_items
-                WHERE status = ?
+                WHERE status = ?{excluded_clause}
                 ORDER BY {order_by}
                 LIMIT 1
             """
-            params = (QUEUED,)
+            params = (QUEUED, *excluded_params)
 
         with self.connect() as connection:
             row = connection.execute(sql, params).fetchone()
@@ -581,6 +706,8 @@ class Store:
             failed_attempts=row["failed_attempts"],
             error=row["error"],
             content_fingerprint=row["content_fingerprint"] if "content_fingerprint" in row.keys() else None,
+            content_hash=row["content_hash"] if "content_hash" in row.keys() else None,
+            visual_hash=row["visual_hash"] if "visual_hash" in row.keys() else None,
             priority=int(row["priority"]) if "priority" in row.keys() else 0,
             video_width=optional_int(row, "video_width"),
             video_height=optional_int(row, "video_height"),
@@ -593,6 +720,15 @@ def normalize_fingerprint(value: str | None) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized or None
+
+
+def normalize_hash(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    return normalized
 
 
 def normalize_positive_int(value: int | str | None) -> int | None:

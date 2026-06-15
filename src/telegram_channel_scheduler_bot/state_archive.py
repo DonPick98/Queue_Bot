@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
-import tempfile
 import zipfile
 
 
@@ -30,10 +31,17 @@ def backup_database(source: Path, destination_db: Path) -> None:
     source_connection = sqlite3.connect(source)
     destination_connection = sqlite3.connect(destination_db)
     try:
+        apply_optional_journal_mode(destination_connection)
         source_connection.backup(destination_connection)
     finally:
         destination_connection.close()
         source_connection.close()
+
+
+def apply_optional_journal_mode(connection: sqlite3.Connection) -> None:
+    journal_mode = os.getenv("BOT_SQLITE_JOURNAL_MODE", "").strip().upper()
+    if journal_mode in {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}:
+        connection.execute(f"PRAGMA journal_mode = {journal_mode}")
 
 
 def create_state_backup(database_path: Path, output_dir: Path) -> Path:
@@ -60,7 +68,7 @@ def create_state_backup(database_path: Path, output_dir: Path) -> Path:
             archive.write(work_db, arcname=work_db.name)
             archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
     finally:
-        if work_db.exists():
+        with suppress(OSError):
             work_db.unlink()
 
     return archive_path
@@ -75,10 +83,9 @@ def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path
     target.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
 
-    with tempfile.TemporaryDirectory(prefix="queue-bot-rolling-backup-") as temp_dir:
-        temp_path = Path(temp_dir)
-        work_db = temp_path / f"queue-bot-state-{timestamp}.sqlite3"
-        temp_archive = temp_path / target.name
+    work_db = target.parent / f".{target.stem}-{timestamp}.sqlite3"
+    temp_archive = target.parent / f".{target.stem}-{timestamp}.zip"
+    try:
         backup_database(source, work_db)
         manifest = {
             "app": "queue-bot",
@@ -91,6 +98,10 @@ def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path
             archive.write(work_db, arcname=work_db.name)
             archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True))
         shutil.copy2(temp_archive, target)
+    finally:
+        for path in (work_db, temp_archive):
+            with suppress(OSError):
+                path.unlink()
 
     return target
 
@@ -101,6 +112,7 @@ def database_has_schema(database_path: Path) -> bool:
 
     connection = sqlite3.connect(database_path)
     try:
+        apply_optional_journal_mode(connection)
         row = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'media_items'"
         ).fetchone()
@@ -115,6 +127,7 @@ def media_item_count(database_path: Path) -> int:
 
     connection = sqlite3.connect(database_path)
     try:
+        apply_optional_journal_mode(connection)
         row = connection.execute("SELECT COUNT(*) FROM media_items").fetchone()
     finally:
         connection.close()
@@ -126,14 +139,15 @@ def validate_database(database_path: Path) -> None:
         raise ValueError("Backup does not look like a Queue Bot database.")
 
 
-def _extract_backup_database(backup_path: Path, extract_dir: Path) -> Path:
+def _extract_backup_database(backup_path: Path, restored_db: Path) -> Path:
     with zipfile.ZipFile(backup_path) as archive:
         database_members = [name for name in archive.namelist() if name.endswith(".sqlite3")]
         if len(database_members) != 1:
             raise ValueError("Backup archive must contain exactly one .sqlite3 file.")
-        archive.extract(database_members[0], path=extract_dir)
+        restored_db.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(database_members[0]) as source, restored_db.open("wb") as destination:
+            shutil.copyfileobj(source, destination)
 
-    restored_db = extract_dir / database_members[0]
     validate_database(restored_db)
     return restored_db
 
@@ -144,19 +158,21 @@ def restore_state_backup(backup_path: Path, database_path: Path) -> RestoreResul
     if not archive_path.exists():
         raise FileNotFoundError(f"Backup not found: {archive_path}")
 
-    with tempfile.TemporaryDirectory(prefix="queue-bot-restore-") as temp_dir:
-        extract_dir = Path(temp_dir)
-        restored_db = _extract_backup_database(archive_path, extract_dir)
-
-        target.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    restored_db = target.parent / f".restore-{timestamp}.sqlite3"
+    try:
+        _extract_backup_database(archive_path, restored_db)
         safety_copy: Path | None = None
         if target.exists():
-            timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
             safety_copy = target.with_suffix(f".before-restore-{timestamp}.sqlite3")
             shutil.copy2(target, safety_copy)
 
         shutil.copy2(restored_db, target)
         return RestoreResult(database_path=target, safety_copy_path=safety_copy)
+    finally:
+        with suppress(OSError):
+            restored_db.unlink()
 
 
 def restore_latest_backup_if_needed(
@@ -175,10 +191,15 @@ def restore_latest_backup_if_needed(
     elif not database_has_schema(target):
         reason = "database_invalid"
     elif restore_if_empty and media_item_count(target) == 0:
-        with tempfile.TemporaryDirectory(prefix="queue-bot-autorestore-check-") as temp_dir:
-            backup_db = _extract_backup_database(archive_path, Path(temp_dir))
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        backup_db = archive_path.parent / f".autorestore-check-{timestamp}.sqlite3"
+        try:
+            _extract_backup_database(archive_path, backup_db)
             if media_item_count(backup_db) > 0:
                 reason = "database_empty"
+        finally:
+            with suppress(OSError):
+                backup_db.unlink()
 
     if not reason:
         return None
