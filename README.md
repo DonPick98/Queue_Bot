@@ -155,6 +155,26 @@ Il bot salva nel database il prossimo orario previsto di pubblicazione. Se chiud
 
 Il comando `/post_now` resta manuale e non sposta la schedule automatica.
 
+## Raspberry self-healing
+
+Per Raspberry e installazioni sempre attive usa il kit `systemd` in:
+
+```text
+scripts/raspberry/
+RASPBERRY_RELIABILITY.md
+```
+
+Installa un servizio che riavvia automaticamente il bot se crasha e un watchdog che controlla ogni 5 minuti health endpoint, rete, database e servizio. Se la recovery fallisce piu volte, il Raspberry viene riavviato automaticamente.
+
+Sul Raspberry:
+
+```bash
+cd /home/pi/Queue_Bot
+git pull
+chmod +x scripts/raspberry/install_queue_bot_service.sh
+./scripts/raspberry/install_queue_bot_service.sh
+```
+
 ## Backup self-healing
 
 Il bot puo proteggersi da restart e deploy:
