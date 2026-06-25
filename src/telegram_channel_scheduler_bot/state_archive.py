@@ -106,6 +106,46 @@ def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path
     return target
 
 
+def backup_reference_path(archive_path: Path) -> Path:
+    target = archive_path.expanduser().resolve()
+    return target.with_suffix(target.suffix + ".telegram.json")
+
+
+def write_telegram_backup_reference(
+    archive_path: Path,
+    *,
+    file_id: str,
+    file_unique_id: str | None = None,
+    chat_id: int | str | None = None,
+    message_id: int | None = None,
+) -> Path:
+    reference_path = backup_reference_path(archive_path)
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "archive_path": str(archive_path.expanduser().resolve()),
+        "file_id": file_id,
+        "file_unique_id": file_unique_id or "",
+        "chat_id": str(chat_id) if chat_id is not None else "",
+        "message_id": message_id,
+        "saved_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    reference_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return reference_path
+
+
+def read_telegram_backup_reference(archive_path: Path) -> dict[str, object] | None:
+    reference_path = backup_reference_path(archive_path)
+    if not reference_path.exists():
+        return None
+    try:
+        payload = json.loads(reference_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not str(payload.get("file_id", "")).strip():
+        return None
+    return payload
+
+
 def database_has_schema(database_path: Path) -> bool:
     if not database_path.exists():
         return False
@@ -179,6 +219,7 @@ def restore_latest_backup_if_needed(
     database_path: Path,
     backup_path: Path,
     restore_if_empty: bool = True,
+    restore_if_backup_newer: bool = False,
 ) -> AutoRestoreResult | None:
     target = database_path.expanduser().resolve()
     archive_path = backup_path.expanduser().resolve()
@@ -200,6 +241,8 @@ def restore_latest_backup_if_needed(
         finally:
             with suppress(OSError):
                 backup_db.unlink()
+    elif restore_if_backup_newer and archive_path.stat().st_mtime > target.stat().st_mtime:
+        reason = "backup_newer"
 
     if not reason:
         return None

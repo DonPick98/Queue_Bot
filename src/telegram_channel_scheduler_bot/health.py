@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import cgi
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -11,6 +10,11 @@ from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    import cgi
+except ModuleNotFoundError:
+    cgi = None
 
 from .balancer import PHOTO, VIDEO
 from .storage import Store
@@ -217,6 +221,8 @@ class HealthHandler(BaseHTTPRequestHandler):
     def _queue_upload(self, media_type: str) -> tuple[int, dict[str, Any]]:
         assert self.store is not None
         assert self.bot_token is not None
+        if cgi is None:
+            return 500, {"ok": False, "error": "multipart_parser_unavailable"}
 
         form = cgi.FieldStorage(
             fp=self.rfile,

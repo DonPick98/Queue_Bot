@@ -8,6 +8,7 @@ from telegram_channel_scheduler_bot.posting_plan import (
     initial_next_publish_at,
     seconds_until_next_publish,
 )
+from telegram_channel_scheduler_bot.scheduling import next_aligned_publish_after
 
 
 class PostingPlanTests(unittest.TestCase):
@@ -86,6 +87,22 @@ class PostingPlanTests(unittest.TestCase):
         next_publish = now - timedelta(minutes=30)
 
         self.assertEqual(seconds_until_next_publish(next_publish, now), 5)
+
+    def test_aligned_schedule_uses_next_two_hour_slot(self):
+        now = datetime(2026, 5, 20, 15, 20, tzinfo=UTC)  # 17:20 Europe/Rome
+
+        self.assertEqual(
+            next_aligned_publish_after(now, 120, "Europe/Rome", "all"),
+            datetime(2026, 5, 20, 16, 0, tzinfo=UTC),  # 18:00 Europe/Rome
+        )
+
+    def test_aligned_schedule_does_not_drift_after_late_publish(self):
+        scheduled = datetime(2026, 5, 19, 22, 0, tzinfo=UTC)  # 00:00 Europe/Rome
+
+        self.assertEqual(
+            next_aligned_publish_after(scheduled, 120, "Europe/Rome", "all"),
+            datetime(2026, 5, 20, 0, 0, tzinfo=UTC),  # 02:00 Europe/Rome
+        )
 
 
 if __name__ == "__main__":

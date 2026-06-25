@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+import json
 import logging
 import math
 import os
 from pathlib import Path
 import re
+import shutil
+import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -39,6 +44,7 @@ from .scheduling import (
     DEFAULT_TIMEZONE,
     format_posting_windows,
     is_within_posting_windows,
+    next_aligned_publish_after,
     next_allowed_datetime,
     next_publish_after_interval,
     parse_posting_windows,
@@ -47,8 +53,10 @@ from .scheduling import (
 from .state_archive import (
     create_rolling_state_backup,
     create_state_backup,
+    read_telegram_backup_reference,
     restore_latest_backup_if_needed,
     restore_state_backup,
+    write_telegram_backup_reference,
 )
 from .storage import AddMediaResult, MediaItem, Store
 
@@ -163,6 +171,11 @@ def get_posting_windows(store: Store) -> str:
     return store.get_setting("posting_windows", "all") or "all"
 
 
+def get_schedule_mode(store: Store) -> str:
+    mode = (store.get_setting("schedule_mode", "anchored") or "anchored").strip().lower()
+    return mode if mode in {"anchored", "interval"} else "anchored"
+
+
 def format_datetime_for_user(value: datetime, timezone_name: str = DEFAULT_TIMEZONE) -> str:
     return value.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d %H:%M")
 
@@ -269,29 +282,57 @@ def get_or_initialize_next_publish_at(store: Store, now: datetime | None = None)
     current_time = now or utcnow()
     existing = parse_datetime_setting(store.get_setting("next_publish_at"))
     if existing is not None:
-        adjusted = next_allowed_datetime(existing, get_timezone_name(store), get_posting_windows(store))
+        if get_schedule_mode(store) == "anchored" and existing <= current_time:
+            adjusted = next_aligned_publish_after(
+                current_time,
+                store.get_int_setting("interval_minutes", 60),
+                get_timezone_name(store),
+                get_posting_windows(store),
+            )
+        else:
+            adjusted = next_allowed_datetime(existing, get_timezone_name(store), get_posting_windows(store))
         if adjusted != existing:
             store.set_setting("next_publish_at", datetime_to_setting(adjusted))
         return adjusted
 
     last_published_at = parse_datetime_setting(store.latest_published_at())
-    next_publish_at = initial_next_publish_at(
-        current_time,
-        store.get_int_setting("interval_minutes", 60),
-        last_published_at=last_published_at,
-    )
+    if get_schedule_mode(store) == "anchored":
+        next_publish_at = next_aligned_publish_after(
+            current_time,
+            store.get_int_setting("interval_minutes", 60),
+            get_timezone_name(store),
+            get_posting_windows(store),
+        )
+    else:
+        next_publish_at = initial_next_publish_at(
+            current_time,
+            store.get_int_setting("interval_minutes", 60),
+            last_published_at=last_published_at,
+        )
     next_publish_at = next_allowed_datetime(next_publish_at, get_timezone_name(store), get_posting_windows(store))
     store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
     return next_publish_at
 
 
-def set_next_publish_after_interval(store: Store, now: datetime | None = None) -> datetime:
-    next_publish_at = next_publish_after_interval(
-        now or utcnow(),
-        store.get_int_setting("interval_minutes", 60),
-        get_timezone_name(store),
-        get_posting_windows(store),
-    )
+def set_next_publish_after_interval(
+    store: Store,
+    now: datetime | None = None,
+    scheduled_for: datetime | None = None,
+) -> datetime:
+    if get_schedule_mode(store) == "anchored":
+        next_publish_at = next_aligned_publish_after(
+            scheduled_for or now or utcnow(),
+            store.get_int_setting("interval_minutes", 60),
+            get_timezone_name(store),
+            get_posting_windows(store),
+        )
+    else:
+        next_publish_at = next_publish_after_interval(
+            now or utcnow(),
+            store.get_int_setting("interval_minutes", 60),
+            get_timezone_name(store),
+            get_posting_windows(store),
+        )
     store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
     return next_publish_at
 
@@ -532,6 +573,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Stato: {'in pausa' if paused else 'attivo'}",
                 f"Timezone: {timezone_name}",
                 f"Intervallo: {format_duration(interval)}",
+                f"Schedule: {get_schedule_mode(store)}",
                 f"Fasce orarie: {format_posting_windows(posting_windows)}",
                 f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
                 f"Post per ciclo: {batch_description}",
@@ -1205,7 +1247,7 @@ async def send_state_backup(application: Application, chat_id: int | str, prefix
         return False
 
     with archive_path.open("rb") as backup_file:
-        await application.bot.send_document(
+        sent_message = await application.bot.send_document(
             chat_id=chat_id,
             document=backup_file,
             filename=archive_path.name,
@@ -1213,6 +1255,14 @@ async def send_state_backup(application: Application, chat_id: int | str, prefix
                 f"{prefix} stato Queue Bot. Conserva questo file: contiene coda, "
                 "impostazioni, deduplica e prossimo orario di pubblicazione."
             ),
+        )
+    if sent_message.document:
+        write_telegram_backup_reference(
+            archive_path,
+            file_id=sent_message.document.file_id,
+            file_unique_id=sent_message.document.file_unique_id,
+            chat_id=chat_id,
+            message_id=sent_message.message_id,
         )
     return True
 
@@ -1233,7 +1283,7 @@ async def create_backup_after_publish(application: Application) -> None:
     for admin_id in admin_ids:
         try:
             with backup_path.open("rb") as backup_file:
-                await application.bot.send_document(
+                sent_message = await application.bot.send_document(
                     chat_id=admin_id,
                     document=backup_file,
                     filename=backup_path.name,
@@ -1241,6 +1291,14 @@ async def create_backup_after_publish(application: Application) -> None:
                         "Backup automatico dopo pubblicazione. "
                         "Contiene coda, impostazioni, deduplica e prossimo orario."
                     ),
+                )
+            if sent_message.document:
+                write_telegram_backup_reference(
+                    backup_path,
+                    file_id=sent_message.document.file_id,
+                    file_unique_id=sent_message.document.file_unique_id,
+                    chat_id=admin_id,
+                    message_id=sent_message.message_id,
                 )
         except TelegramError:
             LOGGER.exception("Failed to send post-publish backup to admin %s", admin_id)
@@ -1647,6 +1705,7 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     store = get_store(context)
     advance_after_run = True
     outcomes: list[PublishOutcome] = []
+    scheduled_for = parse_datetime_setting(store.get_setting("next_publish_at"))
     try:
         now = utcnow()
         if not is_within_posting_windows(now, get_timezone_name(store), get_posting_windows(store)):
@@ -1667,7 +1726,7 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await check_queue_coverage_alert(context.application, notify=True)
     finally:
         if advance_after_run:
-            next_publish_at = set_next_publish_after_interval(store)
+            next_publish_at = set_next_publish_after_interval(store, scheduled_for=scheduled_for)
             LOGGER.info("Next publish scheduled at %s", datetime_to_setting(next_publish_at))
         if any(outcome.status == "published" for outcome in outcomes):
             try:
@@ -1803,11 +1862,16 @@ def auto_restore_state(config: AppConfig) -> None:
     if not config.backup_auto_restore_enabled:
         return
 
+    backup_path = Path(config.default_backup_after_publish_path)
+    if config.backup_telegram_auto_download_enabled:
+        download_latest_telegram_backup(config.bot_token, backup_path)
+
     try:
         result = restore_latest_backup_if_needed(
             config.database_path,
-            Path(config.default_backup_after_publish_path),
+            backup_path,
             restore_if_empty=config.backup_auto_restore_if_empty,
+            restore_if_backup_newer=config.backup_telegram_auto_download_enabled,
         )
     except Exception:
         LOGGER.exception("Auto-restore from latest backup failed")
@@ -1821,6 +1885,47 @@ def auto_restore_state(config: AppConfig) -> None:
             result.reason,
             result.safety_copy_path,
         )
+
+
+def download_latest_telegram_backup(bot_token: str, backup_path: Path) -> Path | None:
+    if not bot_token:
+        return None
+    reference = read_telegram_backup_reference(backup_path)
+    if not reference:
+        return None
+
+    file_id = str(reference["file_id"])
+    target = backup_path.expanduser().resolve()
+    temp_target = target.with_suffix(target.suffix + ".telegram-download")
+    try:
+        query = urllib.parse.urlencode({"file_id": file_id})
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/bot{bot_token}/getFile?{query}",
+            timeout=30,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not payload.get("ok"):
+            LOGGER.warning("Telegram getFile failed for backup reference: %s", payload)
+            return None
+        file_path = payload["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(file_url, timeout=60) as response, temp_target.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        validate_downloaded_backup = restore_state_backup(temp_target, target.parent / ".telegram-download-check.sqlite3")
+        with suppress(OSError):
+            validate_downloaded_backup.database_path.unlink()
+            if validate_downloaded_backup.safety_copy_path:
+                validate_downloaded_backup.safety_copy_path.unlink()
+        shutil.copy2(temp_target, target)
+        LOGGER.info("Downloaded latest Telegram backup to %s", target)
+        return target
+    except Exception:
+        LOGGER.exception("Failed to download latest Telegram backup")
+        return None
+    finally:
+        with suppress(OSError):
+            temp_target.unlink()
 
 
 def backup_before_shutdown(application: Application, config: AppConfig) -> None:

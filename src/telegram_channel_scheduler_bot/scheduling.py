@@ -134,3 +134,23 @@ def next_publish_after_interval(
 ) -> datetime:
     candidate = now.astimezone(UTC) + timedelta(minutes=max(1, interval_minutes))
     return next_allowed_datetime(candidate, timezone_name, windows_raw)
+
+
+def next_aligned_publish_after(
+    value: datetime,
+    interval_minutes: int,
+    timezone_name: str,
+    windows_raw: str | None,
+) -> datetime:
+    interval = max(1, interval_minutes)
+    zone = get_zone(timezone_name)
+    local = value.astimezone(zone)
+    midnight = datetime.combine(local.date(), time(0, 0), tzinfo=zone)
+    elapsed_minutes = (local - midnight).total_seconds() / 60
+    slots_elapsed = int(elapsed_minutes // interval) + 1
+    candidate = midnight + timedelta(minutes=slots_elapsed * interval)
+    candidate_utc = candidate.astimezone(UTC)
+    allowed = next_allowed_datetime(candidate_utc, timezone_name, windows_raw)
+    if allowed == candidate_utc:
+        return allowed
+    return next_aligned_publish_after(allowed, interval, timezone_name, windows_raw)

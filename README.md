@@ -25,7 +25,8 @@ Nota importante: il Bot API di Telegram non permette a un bot di leggere tutta l
 TELEGRAM_BOT_TOKEN=replace-with-botfather-token
 ADMIN_USER_IDS=123456789
 TELEGRAM_CHANNEL_ID=@nome_del_tuo_canale
-DEFAULT_POST_INTERVAL_MINUTES=60
+DEFAULT_POST_INTERVAL_MINUTES=120
+DEFAULT_SCHEDULE_MODE=anchored
 DEFAULT_BATCH_MODE=fixed
 DEFAULT_POSTS_PER_RUN=1
 DEFAULT_QUEUE_ORDER=random
@@ -41,6 +42,7 @@ BACKUP_AFTER_PUBLISH_SEND_TELEGRAM=false
 BACKUP_AFTER_PUBLISH_PATH=./state_backups/latest-state.zip
 BACKUP_AUTO_RESTORE_ENABLED=true
 BACKUP_AUTO_RESTORE_IF_EMPTY=true
+BACKUP_TELEGRAM_AUTO_DOWNLOAD_ENABLED=true
 BACKUP_BEFORE_SHUTDOWN_ENABLED=true
 DATABASE_PATH=./data/bot.sqlite3
 ```
@@ -150,8 +152,11 @@ Il bot controlla automaticamente se i media in coda bastano per le prossime 24 o
 
 Il bot salva nel database il prossimo orario previsto di pubblicazione. Se chiudi `start_bot.bat` o il PC resta spento, al riavvio succede questo:
 
-- se il prossimo orario non e ancora arrivato, il bot aspetta il tempo residuo;
-- se il prossimo orario e passato, il bot pubblica appena possibile e poi riparte da quel momento con l'intervallo configurato.
+- con `DEFAULT_SCHEDULE_MODE=anchored`, pubblica sugli slot fissi calcolati da mezzanotte nel timezone configurato;
+- con intervallo 120 minuti gli slot sono 00:00, 02:00, 04:00, ...;
+- se riparte alle 17:20, il prossimo slot e 18:00;
+- se una pubblicazione programmata per 00:00 riesce alle 00:01, lo slot successivo resta 02:00;
+- con `DEFAULT_SCHEDULE_MODE=interval`, mantiene il vecchio comportamento basato sull'intervallo dall'ultimo post.
 
 Il comando `/post_now` resta manuale e non sposta la schedule automatica.
 
@@ -180,8 +185,12 @@ chmod +x scripts/raspberry/install_queue_bot_service.sh
 Il bot puo proteggersi da restart e deploy:
 
 - dopo ogni pubblicazione crea o sovrascrive `latest-state.zip`;
+- quando invia `latest-state.zip` su Telegram, salva anche il `file_id` del documento;
+- all'avvio scarica da Telegram l'ultimo backup noto prima di pianificare pubblicazioni;
 - prima dello shutdown crea un altro backup rolling;
-- all'avvio, se il database manca, e vuoto o non sembra valido, prova a ripristinare automaticamente da `latest-state.zip`.
+- all'avvio, se il database manca, e vuoto, non sembra valido, o il backup e piu recente del DB, prova a ripristinare automaticamente da `latest-state.zip`.
+
+Limite Telegram: il Bot API non permette al bot di cercare liberamente nella cronologia vecchia della chat. Il restore automatico da Telegram funziona quando il bot ha salvato il `file_id` dell'ultimo backup inviato.
 
 Su host senza storage persistente conviene anche inviare il backup su Telegram:
 

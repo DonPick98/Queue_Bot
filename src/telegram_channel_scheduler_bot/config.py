@@ -71,6 +71,13 @@ def _posting_windows(name: str, default: str = DEFAULT_POSTING_WINDOWS) -> str:
     return raw
 
 
+def _schedule_mode(name: str, default: str = "anchored") -> str:
+    raw = os.getenv(name, default).strip().lower() or default
+    if raw not in {"anchored", "interval"}:
+        raise ValueError(f"{name} deve essere 'anchored' oppure 'interval'.")
+    return raw
+
+
 @dataclass(frozen=True)
 class AppConfig:
     bot_token: str
@@ -86,6 +93,7 @@ class AppConfig:
     default_queue_order: str
     default_timezone: str
     default_posting_windows: str
+    default_schedule_mode: str
     default_auto_backup_enabled: bool
     default_auto_backup_interval_minutes: int
     default_backup_after_publish_enabled: bool
@@ -94,6 +102,7 @@ class AppConfig:
     backup_auto_restore_enabled: bool
     backup_auto_restore_if_empty: bool
     backup_before_shutdown_enabled: bool
+    backup_telegram_auto_download_enabled: bool
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -117,6 +126,7 @@ class AppConfig:
             default_queue_order=_queue_order("DEFAULT_QUEUE_ORDER", "random"),
             default_timezone=validate_timezone(os.getenv("DEFAULT_TIMEZONE", DEFAULT_TIMEZONE)),
             default_posting_windows=_posting_windows("DEFAULT_POSTING_WINDOWS", DEFAULT_POSTING_WINDOWS),
+            default_schedule_mode=_schedule_mode("DEFAULT_SCHEDULE_MODE", "anchored"),
             default_auto_backup_enabled=_bool("AUTO_BACKUP_ENABLED", False),
             default_auto_backup_interval_minutes=_positive_int("AUTO_BACKUP_INTERVAL_MINUTES", 24 * 60),
             default_backup_after_publish_enabled=_bool("BACKUP_AFTER_PUBLISH_ENABLED", True),
@@ -129,4 +139,5 @@ class AppConfig:
             backup_auto_restore_enabled=_bool("BACKUP_AUTO_RESTORE_ENABLED", True),
             backup_auto_restore_if_empty=_bool("BACKUP_AUTO_RESTORE_IF_EMPTY", True),
             backup_before_shutdown_enabled=_bool("BACKUP_BEFORE_SHUTDOWN_ENABLED", True),
+            backup_telegram_auto_download_enabled=_bool("BACKUP_TELEGRAM_AUTO_DOWNLOAD_ENABLED", True),
         )

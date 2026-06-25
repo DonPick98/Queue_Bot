@@ -31,6 +31,7 @@ class StoreTests(unittest.TestCase):
                 default_queue_order="random",
                 default_timezone="Europe/Rome",
                 default_posting_windows="all",
+                default_schedule_mode="anchored",
                 default_auto_backup_enabled=False,
                 default_auto_backup_interval_minutes=24 * 60,
                 default_backup_after_publish_enabled=True,
@@ -39,6 +40,7 @@ class StoreTests(unittest.TestCase):
                 backup_auto_restore_enabled=True,
                 backup_auto_restore_if_empty=True,
                 backup_before_shutdown_enabled=True,
+                backup_telegram_auto_download_enabled=True,
             )
         )
         return store

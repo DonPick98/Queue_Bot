@@ -208,6 +208,7 @@ class Store:
             "queue_order": config.default_queue_order,
             "timezone": config.default_timezone,
             "posting_windows": config.default_posting_windows,
+            "schedule_mode": config.default_schedule_mode,
             "auto_backup_enabled": "true" if config.default_auto_backup_enabled else "false",
             "auto_backup_interval_minutes": str(config.default_auto_backup_interval_minutes),
             "backup_alert_active": "false",
@@ -221,11 +222,30 @@ class Store:
             defaults["channel_id"] = config.channel_id
 
         with self.connect() as connection:
+            existing_schedule_mode = connection.execute(
+                "SELECT value FROM settings WHERE key = 'schedule_mode'"
+            ).fetchone()
             for key, value in defaults.items():
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                     (key, value),
                 )
+            if existing_schedule_mode is None:
+                connection.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES('interval_minutes', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (str(config.default_interval_minutes),),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES('schedule_mode', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (config.default_schedule_mode,),
+                )
+                connection.execute("DELETE FROM settings WHERE key = 'next_publish_at'")
 
         if config.admin_user_ids:
             self.ensure_admin_ids(config.admin_user_ids)
