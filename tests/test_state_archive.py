@@ -1,6 +1,8 @@
 from contextlib import suppress
 from pathlib import Path
 import shutil
+import sqlite3
+import zipfile
 import unittest
 from uuid import uuid4
 
@@ -90,6 +92,32 @@ class StateArchiveTests(unittest.TestCase):
         self.assertTrue(second.exists())
         self.assertGreater(second.stat().st_size, 0)
         self.assertGreaterEqual(second.stat().st_mtime_ns, first_mtime)
+
+    def test_rolling_backup_vacuums_copied_database(self):
+        root, suffix = self.make_paths()
+        database = root / f"source-{suffix}.sqlite3"
+        archive = root / f"latest-state-{suffix}.zip"
+        extracted = root / f"extracted-{suffix}.sqlite3"
+
+        store = Store(database)
+        store.initialize()
+        store.add_media("photo", "file-1", "unique-1", None, 123)
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE backup_bloat(value BLOB)")
+            connection.execute("INSERT INTO backup_bloat(value) VALUES(zeroblob(1048576))")
+            connection.execute("DELETE FROM backup_bloat")
+
+        create_rolling_state_backup(database, archive)
+
+        with zipfile.ZipFile(archive) as backup_zip:
+            database_members = [name for name in backup_zip.namelist() if name.endswith(".sqlite3")]
+            self.assertEqual(len(database_members), 1)
+            with backup_zip.open(database_members[0]) as source, extracted.open("wb") as target:
+                shutil.copyfileobj(source, target)
+
+        with sqlite3.connect(extracted) as connection:
+            freelist_count = connection.execute("PRAGMA freelist_count").fetchone()[0]
+        self.assertEqual(freelist_count, 0)
 
     def test_restore_latest_backup_if_needed_restores_missing_database(self):
         root, suffix = self.make_paths()

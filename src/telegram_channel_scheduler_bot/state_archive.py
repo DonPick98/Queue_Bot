@@ -36,12 +36,30 @@ def backup_database(source: Path, destination_db: Path) -> None:
     finally:
         destination_connection.close()
         source_connection.close()
+    compact_backup_database(destination_db)
 
 
 def apply_optional_journal_mode(connection: sqlite3.Connection) -> None:
     journal_mode = os.getenv("BOT_SQLITE_JOURNAL_MODE", "").strip().upper()
     if journal_mode in {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}:
         connection.execute(f"PRAGMA journal_mode = {journal_mode}")
+
+
+def sqlite_vacuum_enabled() -> bool:
+    raw = os.getenv("BACKUP_SQLITE_VACUUM_ENABLED", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def compact_backup_database(database_path: Path) -> None:
+    if not sqlite_vacuum_enabled():
+        return
+    connection = sqlite3.connect(database_path)
+    try:
+        apply_optional_journal_mode(connection)
+        connection.execute("PRAGMA optimize")
+        connection.execute("VACUUM")
+    finally:
+        connection.close()
 
 
 def create_state_backup(database_path: Path, output_dir: Path) -> Path:
@@ -61,6 +79,7 @@ def create_state_backup(database_path: Path, output_dir: Path) -> Path:
         "created_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "database_file": work_db.name,
         "source_database": str(source),
+        "sqlite_vacuumed": sqlite_vacuum_enabled(),
     }
 
     try:
@@ -93,6 +112,7 @@ def create_rolling_state_backup(database_path: Path, archive_path: Path) -> Path
             "database_file": work_db.name,
             "source_database": str(source),
             "rolling_backup": True,
+            "sqlite_vacuumed": sqlite_vacuum_enabled(),
         }
         with zipfile.ZipFile(temp_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(work_db, arcname=work_db.name)
