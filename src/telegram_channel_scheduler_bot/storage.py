@@ -611,6 +611,19 @@ class Store:
         counts.update({row["media_type"]: row["count"] for row in rows})
         return counts
 
+    def recent_published_media_types(self, limit: int) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT media_type
+                FROM publish_log
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(0, int(limit)),),
+            ).fetchall()
+        return [row["media_type"] for row in rows]
+
     def latest_published_at(self) -> str | None:
         with self.connect() as connection:
             row = connection.execute(

@@ -1527,13 +1527,15 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
         return PublishOutcome(status="no_channel", message="Canale non impostato. Usa /set_channel.")
 
     queued = store.queued_counts_by_type()
-    recent = store.recent_published_counts_by_type(store.get_int_setting("balance_window", 20))
+    photo_ratio = store.get_int_setting("photo_ratio", 1)
+    video_ratio = store.get_int_setting("video_ratio", 1)
+    balance_window = store.get_int_setting("balance_window", 20)
+    recent_types = store.recent_published_media_types(max(balance_window, photo_ratio, video_ratio))
     media_type = choose_media_type(
         queued,
-        recent,
-        store.get_int_setting("photo_ratio", 1),
-        store.get_int_setting("video_ratio", 1),
-        store.get_setting("last_published_type", "") or None,
+        recent_types,
+        photo_ratio,
+        video_ratio,
     )
     if media_type is None:
         return PublishOutcome(status="empty", message="La coda e vuota.")

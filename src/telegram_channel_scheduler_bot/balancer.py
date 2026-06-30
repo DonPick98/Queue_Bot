@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 PHOTO = "photo"
@@ -10,12 +10,11 @@ MEDIA_TYPES = (PHOTO, VIDEO)
 
 def choose_media_type(
     queued_counts: Mapping[str, int],
-    recent_published_counts: Mapping[str, int],
+    recent_published_types: Sequence[str],
     photo_ratio: int,
     video_ratio: int,
-    last_published_type: str | None = None,
 ) -> str | None:
-    """Choose the next media type using weighted fairness over recent posts."""
+    """Choose the next media type without repaying old missing-media debt."""
 
     weights = {
         PHOTO: max(1, int(photo_ratio)),
@@ -27,19 +26,22 @@ def choose_media_type(
     if len(candidates) == 1:
         return candidates[0]
 
-    scores = {
-        media_type: recent_published_counts.get(media_type, 0) / weights[media_type]
-        for media_type in candidates
-    }
-    best_score = min(scores.values())
-    tied = [media_type for media_type, score in scores.items() if score == best_score]
+    latest_type = next(
+        (media_type for media_type in recent_published_types if media_type in MEDIA_TYPES),
+        None,
+    )
+    if latest_type in candidates:
+        current_run = 0
+        for media_type in recent_published_types:
+            if media_type != latest_type:
+                break
+            current_run += 1
 
-    if len(tied) == 1:
-        return tied[0]
+        if current_run < weights[latest_type]:
+            return latest_type
 
-    if last_published_type in tied:
-        alternatives = [media_type for media_type in tied if media_type != last_published_type]
-        if alternatives:
-            tied = alternatives
+        other_type = VIDEO if latest_type == PHOTO else PHOTO
+        if other_type in candidates:
+            return other_type
 
-    return max(tied, key=lambda media_type: (weights[media_type], queued_counts.get(media_type, 0)))
+    return max(candidates, key=lambda media_type: (weights[media_type], queued_counts.get(media_type, 0)))
