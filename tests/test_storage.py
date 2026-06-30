@@ -148,6 +148,14 @@ class StoreTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertGreaterEqual(second, first)
 
+    def test_recent_published_media_types_returns_newest_first(self):
+        store = self.make_store()
+        store.mark_published("unique-1", "photo", source="bot", channel_message_id=1)
+        store.mark_published("unique-2", "photo", source="bot", channel_message_id=2)
+        store.mark_published("unique-3", "video", source="bot", channel_message_id=3)
+
+        self.assertEqual(store.recent_published_media_types(3), ["video", "photo", "photo"])
+
     def test_list_published_photos_returns_only_published_photos(self):
         store = self.make_store()
         first = store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)

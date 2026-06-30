@@ -256,7 +256,7 @@ Dettagli in `STATE_AND_GITHUB.md`.
 
 ## Come lavora il bilanciamento
 
-Il bot conta foto e video negli ultimi `BALANCE_WINDOW` post tracciati. Se il rapporto e `1:1` e negli ultimi post ci sono troppe foto, il prossimo contenuto preferito sara un video, se disponibile. Se manca un tipo di media, pubblica comunque quello disponibile invece di bloccare la coda.
+Il bot guarda la sequenza finale dei post tracciati e rispetta il rapporto foto/video come ritmo corrente, senza recuperare vecchi "debiti" creati quando un tipo di media mancava dalla coda. Per esempio, con `/set_ratio 2 1`, dopo un video pubblica due foto, se disponibili, prima di scegliere un altro video. Se manca un tipo di media, pubblica comunque quello disponibile invece di bloccare la coda.
 
 ## Deduplica
 

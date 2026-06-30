@@ -6,22 +6,28 @@ from uuid import uuid4
 from telegram.error import TelegramError
 
 from telegram_channel_scheduler_bot.storage import FAILED, PUBLISHED, QUEUED, Store
-from telegram_channel_scheduler_bot.telegram_app import publish_next
+from telegram_channel_scheduler_bot.telegram_app import publish_many, publish_next
 
 
 class FakeBot:
     def __init__(self) -> None:
         self.photos: list[str] = []
+        self.videos: list[str] = []
+        self.sent_media: list[tuple[str, str]] = []
 
     async def send_photo(self, **kwargs):
         photo = kwargs["photo"]
         self.photos.append(photo)
+        self.sent_media.append(("photo", photo))
         if photo == "bad-file":
             raise TelegramError("file is unavailable")
         return SimpleNamespace(message_id=777)
 
     async def send_video(self, **kwargs):
-        raise AssertionError("send_video should not be called in this test")
+        video = kwargs["video"]
+        self.videos.append(video)
+        self.sent_media.append(("video", video))
+        return SimpleNamespace(message_id=888)
 
 
 class PublisherTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +92,32 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
         self.assertEqual(row["status"], QUEUED)
         self.assertEqual(row["failed_attempts"], 1)
+
+    async def test_publish_many_does_not_burst_videos_to_repay_photo_history(self):
+        store = self.make_store()
+        store.set_setting("photo_ratio", "2")
+        store.set_setting("video_ratio", "1")
+        for index in range(8):
+            store.mark_published(f"published-photo-{index}", "photo", source="bot")
+        for index in range(3):
+            store.add_media("video", f"video-{index}", f"queued-video-{index}", None, 123)
+        for index in range(4):
+            store.add_media("photo", f"photo-{index}", f"queued-photo-{index}", None, 123)
+
+        app = SimpleNamespace(bot=FakeBot(), bot_data={"store": store})
+
+        outcomes = await publish_many(app, count=4, manual=True)
+
+        self.assertTrue(all(outcome.status == "published" for outcome in outcomes))
+        self.assertEqual(
+            app.bot.sent_media,
+            [
+                ("video", "video-0"),
+                ("photo", "photo-0"),
+                ("photo", "photo-1"),
+                ("video", "video-1"),
+            ],
+        )
 
 
 if __name__ == "__main__":
