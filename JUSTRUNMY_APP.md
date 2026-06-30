@@ -118,7 +118,8 @@ Esempio foto:
 curl -X POST "https://TUO-DOMINIO/api/queue/photo" \
   -H "Authorization: Bearer un-segreto-lungo-random" \
   -F "media=@foto.jpg" \
-  -F "caption=Test caption"
+  -F "caption=Test caption" \
+  -F "available_after_publish_count=0"
 ```
 
 Esempio video:
@@ -137,7 +138,8 @@ Risposta tipica:
   "ok": true,
   "queue_status": "queued",
   "media_id": 12,
-  "media_type": "photo"
+  "media_type": "photo",
+  "available_after_publish_count": 0
 }
 ```
 

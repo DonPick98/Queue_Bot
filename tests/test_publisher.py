@@ -93,6 +93,33 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], QUEUED)
         self.assertEqual(row["failed_attempts"], 1)
 
+    async def test_publish_next_respects_available_after_publish_count(self):
+        store = self.make_store()
+        delayed = store.add_media(
+            "photo",
+            "delayed-file",
+            "delayed-unique",
+            None,
+            123,
+            priority=100,
+            available_after_publish_count=2,
+        )
+        ready = store.add_media("photo", "ready-file", "ready-unique", None, 123)
+        app = SimpleNamespace(bot=FakeBot(), bot_data={"store": store})
+
+        first_outcome = await publish_next(app)
+
+        self.assertEqual(first_outcome.status, "published")
+        self.assertEqual(first_outcome.media_item.id, ready.media_item.id)
+        self.assertEqual(app.bot.photos, ["ready-file"])
+
+        store.mark_published("external-unique", "video", source="bot")
+        second_outcome = await publish_next(app)
+
+        self.assertEqual(second_outcome.status, "published")
+        self.assertEqual(second_outcome.media_item.id, delayed.media_item.id)
+        self.assertEqual(app.bot.photos, ["ready-file", "delayed-file"])
+
     async def test_publish_many_does_not_burst_videos_to_repay_photo_history(self):
         store = self.make_store()
         store.set_setting("photo_ratio", "2")

@@ -257,6 +257,13 @@ class HealthHandler(BaseHTTPRequestHandler):
             priority = max(0, int(str(form.getfirst("priority") or "0").strip() or "0"))
         except ValueError:
             priority = 0
+        try:
+            available_after_publish_count = max(
+                0,
+                int(str(form.getfirst("available_after_publish_count") or "0").strip() or "0"),
+            )
+        except ValueError:
+            available_after_publish_count = 0
 
         fields = {"chat_id": staging_chat_id}
         if caption:
@@ -296,6 +303,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             content_hash=content_hash,
             visual_hash=visual_hash,
             priority=priority,
+            available_after_publish_count=available_after_publish_count,
             video_width=video_width,
             video_height=video_height,
             video_duration=video_duration,
@@ -309,6 +317,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             "queue_status": add_result.status,
             "media_id": add_result.media_item.id if add_result.media_item else None,
             "media_type": media_type,
+            "available_after_publish_count": (
+                add_result.media_item.available_after_publish_count
+                if add_result.media_item
+                else None
+            ),
             "staging_chat_id": staging_chat_id,
             "staging_message_id": message["message_id"],
         }

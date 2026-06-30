@@ -227,6 +227,7 @@ POST /api/queue/video
 ```
 
 Da proteggere con `QUEUE_API_TOKEN`.
+Il form accetta anche `priority` e `available_after_publish_count`: il secondo lascia il media in coda ma lo rende pubblicabile solo dopo quel numero totale di pubblicazioni nel `publish_log`.
 
 Per inviare rapidamente foto e video da iPhone con Apple Shortcuts o Scriptable:
 

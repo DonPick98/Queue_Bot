@@ -201,6 +201,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first_photo.file_unique_id, "unique-photo-2")
         self.assertEqual(first_photo.priority, 100)
 
+    def test_get_queued_item_skips_until_publish_count_reaches_gate(self):
+        store = self.make_store()
+        store.add_media(
+            "photo",
+            "delayed-file",
+            "delayed-unique",
+            None,
+            123,
+            priority=100,
+            available_after_publish_count=2,
+        )
+        store.add_media("photo", "ready-file", "ready-unique", None, 123)
+
+        first_photo = store.get_queued_item("photo", order="chronological")
+
+        self.assertEqual(first_photo.file_unique_id, "ready-unique")
+
+        store.mark_published("published-1", "photo", source="bot")
+        store.mark_published("published-2", "video", source="bot")
+        delayed_photo = store.get_queued_item("photo", order="chronological")
+
+        self.assertEqual(delayed_photo.file_unique_id, "delayed-unique")
+
     def test_get_queued_item_random_respects_requested_type(self):
         store = self.make_store()
         store.add_media("photo", "file-photo-1", "unique-photo-1", None, 123)

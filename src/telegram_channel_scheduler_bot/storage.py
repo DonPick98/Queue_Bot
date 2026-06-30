@@ -39,6 +39,7 @@ class MediaItem:
     content_hash: str | None = None
     visual_hash: str | None = None
     priority: int = 0
+    available_after_publish_count: int = 0
     video_width: int | None = None
     video_height: int | None = None
     video_duration: int | None = None
@@ -98,6 +99,7 @@ class Store:
                     content_hash TEXT,
                     visual_hash TEXT,
                     priority INTEGER NOT NULL DEFAULT 0,
+                    available_after_publish_count INTEGER NOT NULL DEFAULT 0,
                     video_width INTEGER,
                     video_height INTEGER,
                     video_duration INTEGER
@@ -135,6 +137,7 @@ class Store:
             self._ensure_column(connection, "media_items", "content_hash TEXT")
             self._ensure_column(connection, "media_items", "visual_hash TEXT")
             self._ensure_column(connection, "media_items", "priority INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "media_items", "available_after_publish_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "media_items", "video_width INTEGER")
             self._ensure_column(connection, "media_items", "video_height INTEGER")
             self._ensure_column(connection, "media_items", "video_duration INTEGER")
@@ -308,6 +311,7 @@ class Store:
         content_hash: str | None = None,
         visual_hash: str | None = None,
         priority: int = 0,
+        available_after_publish_count: int = 0,
         video_width: int | None = None,
         video_height: int | None = None,
         video_duration: int | None = None,
@@ -316,6 +320,7 @@ class Store:
         content_hash = normalize_hash(content_hash)
         visual_hash = normalize_hash(visual_hash)
         priority = max(0, int(priority or 0))
+        available_after_publish_count = max(0, int(available_after_publish_count or 0))
         video_width = normalize_positive_int(video_width)
         video_height = normalize_positive_int(video_height)
         video_duration = normalize_positive_int(video_duration)
@@ -345,9 +350,9 @@ class Store:
                     INSERT INTO media_items(
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
                         status, content_fingerprint, content_hash, visual_hash, priority,
-                        video_width, video_height, video_duration
+                        available_after_publish_count, video_width, video_height, video_duration
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -361,6 +366,7 @@ class Store:
                         content_hash,
                         visual_hash,
                         priority,
+                        available_after_publish_count,
                         video_width,
                         video_height,
                         video_duration,
@@ -636,6 +642,11 @@ class Store:
             ).fetchone()
         return row["published_at"] if row else None
 
+    def published_count(self) -> int:
+        with self.connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS count FROM publish_log").fetchone()
+        return int(row["count"] or 0)
+
     def get_queued_item(
         self,
         media_type: str | None = None,
@@ -658,19 +669,22 @@ class Store:
         if media_type:
             sql = f"""
                 SELECT * FROM media_items
-                WHERE status = ? AND media_type = ?{excluded_clause}
+                WHERE status = ?
+                  AND media_type = ?
+                  AND available_after_publish_count <= ?{excluded_clause}
                 ORDER BY {order_by}
                 LIMIT 1
             """
-            params: tuple[object, ...] = (QUEUED, media_type, *excluded_params)
+            params: tuple[object, ...] = (QUEUED, media_type, self.published_count(), *excluded_params)
         else:
             sql = f"""
                 SELECT * FROM media_items
-                WHERE status = ?{excluded_clause}
+                WHERE status = ?
+                  AND available_after_publish_count <= ?{excluded_clause}
                 ORDER BY {order_by}
                 LIMIT 1
             """
-            params = (QUEUED, *excluded_params)
+            params = (QUEUED, self.published_count(), *excluded_params)
 
         with self.connect() as connection:
             row = connection.execute(sql, params).fetchone()
@@ -742,6 +756,11 @@ class Store:
             content_hash=row["content_hash"] if "content_hash" in row.keys() else None,
             visual_hash=row["visual_hash"] if "visual_hash" in row.keys() else None,
             priority=int(row["priority"]) if "priority" in row.keys() else 0,
+            available_after_publish_count=(
+                int(row["available_after_publish_count"])
+                if "available_after_publish_count" in row.keys()
+                else 0
+            ),
             video_width=optional_int(row, "video_width"),
             video_height=optional_int(row, "video_height"),
             video_duration=optional_int(row, "video_duration"),
