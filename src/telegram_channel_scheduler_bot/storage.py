@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -47,6 +48,21 @@ class MediaItem:
     notification_silent: bool | None = None
     notification_local_date: str | None = None
     notification_position: int | None = None
+    source_id: str | None = None
+    source_label: str | None = None
+    derived_tags: tuple[str, ...] = ()
+    media_width: int | None = None
+    media_height: int | None = None
+    preview_eligible_at: str | None = None
+    preview_published_at: str | None = None
+    preview_message_id: int | None = None
+    preview_variant: str | None = None
+    preview_memberpass_link_version: str | None = None
+    preview_notification_silent: bool | None = None
+    preview_notification_local_date: str | None = None
+    preview_notification_position: int | None = None
+    preview_failed_attempts: int = 0
+    preview_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +71,24 @@ class NotificationPolicy:
     local_date: str
     position: int
     planned_posts: int
+
+
+@dataclass(frozen=True)
+class PreviewConversionEvent:
+    id: int
+    kind: str
+    event_key: str
+    status: str
+    eligible_at: str
+    start_at: str
+    end_at: str
+    premium_count: int
+    preview_count: int
+    media_item_ids: tuple[int, ...]
+    memberpass_link_version: str
+    message_id: int | None
+    attempts: int
+    error: str | None
 
 
 @dataclass(frozen=True)
@@ -149,6 +183,29 @@ class Store:
                     audible_reserved INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS preview_day_plans (
+                    local_date TEXT PRIMARY KEY,
+                    next_position INTEGER NOT NULL DEFAULT 0,
+                    audible_reserved INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS preview_conversion_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('upgrade', 'weekly_recap')),
+                    event_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'sent')) DEFAULT 'pending',
+                    eligible_at TEXT NOT NULL,
+                    start_at TEXT NOT NULL,
+                    end_at TEXT NOT NULL,
+                    premium_count INTEGER NOT NULL,
+                    preview_count INTEGER NOT NULL,
+                    media_item_ids_json TEXT NOT NULL DEFAULT '[]',
+                    memberpass_link_version TEXT NOT NULL,
+                    message_id INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_media_items_status_type
                     ON media_items(status, media_type, added_at);
 
@@ -167,6 +224,21 @@ class Store:
             self._ensure_column(connection, "media_items", "notification_silent INTEGER")
             self._ensure_column(connection, "media_items", "notification_local_date TEXT")
             self._ensure_column(connection, "media_items", "notification_position INTEGER")
+            self._ensure_column(connection, "media_items", "source_id TEXT")
+            self._ensure_column(connection, "media_items", "source_label TEXT")
+            self._ensure_column(connection, "media_items", "derived_tags_json TEXT")
+            self._ensure_column(connection, "media_items", "media_width INTEGER")
+            self._ensure_column(connection, "media_items", "media_height INTEGER")
+            self._ensure_column(connection, "media_items", "preview_eligible_at TEXT")
+            self._ensure_column(connection, "media_items", "preview_published_at TEXT")
+            self._ensure_column(connection, "media_items", "preview_message_id INTEGER")
+            self._ensure_column(connection, "media_items", "preview_variant TEXT")
+            self._ensure_column(connection, "media_items", "preview_memberpass_link_version TEXT")
+            self._ensure_column(connection, "media_items", "preview_notification_silent INTEGER")
+            self._ensure_column(connection, "media_items", "preview_notification_local_date TEXT")
+            self._ensure_column(connection, "media_items", "preview_notification_position INTEGER")
+            self._ensure_column(connection, "media_items", "preview_failed_attempts INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "media_items", "preview_error TEXT")
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
             self._ensure_column(connection, "published_media", "content_hash TEXT")
             self._ensure_column(connection, "published_media", "visual_hash TEXT")
@@ -212,6 +284,13 @@ class Store:
                     WHERE visual_hash IS NOT NULL AND visual_hash != ''
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_media_items_preview_eligible
+                    ON media_items(preview_eligible_at, preview_published_at, published_at)
+                    WHERE status = 'published' AND media_type = 'photo'
+                """
+            )
 
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, table: str, definition: str) -> None:
@@ -247,9 +326,19 @@ class Store:
             if config.default_backup_after_publish_send_telegram
             else "false",
             "backup_after_publish_path": config.default_backup_after_publish_path,
+            "preview_delay_hours": str(config.preview_delay_hours),
+            "preview_posts_per_day": str(config.preview_posts_per_day),
+            "preview_posting_times": config.preview_posting_times,
+            "preview_memberpass_url": config.preview_memberpass_url,
+            "preview_memberpass_link_version": config.preview_memberpass_link_version,
+            "preview_attribution": config.preview_attribution,
+            "preview_recap_weekday": str(config.preview_recap_weekday),
+            "preview_recap_time": config.preview_recap_time,
         }
         if config.channel_id:
             defaults["channel_id"] = config.channel_id
+        if config.preview_channel_id:
+            defaults["preview_channel_id"] = config.preview_channel_id
 
         with self.connect() as connection:
             existing_schedule_mode = connection.execute(
@@ -276,6 +365,17 @@ class Store:
                     (config.default_schedule_mode,),
                 )
                 connection.execute("DELETE FROM settings WHERE key = 'next_publish_at'")
+            connection.execute(
+                """
+                UPDATE media_items
+                SET preview_eligible_at = strftime(
+                    '%Y-%m-%dT%H:%M:%S+00:00', published_at,
+                    '+' || COALESCE((SELECT value FROM settings WHERE key = 'preview_delay_hours'), '48') || ' hours'
+                )
+                WHERE status = 'published' AND media_type = 'photo'
+                  AND published_at IS NOT NULL AND preview_eligible_at IS NULL
+                """
+            )
 
         if config.admin_user_ids:
             self.ensure_admin_ids(config.admin_user_ids)
@@ -342,6 +442,11 @@ class Store:
         video_width: int | None = None,
         video_height: int | None = None,
         video_duration: int | None = None,
+        source_id: str | int | None = None,
+        source_label: str | None = None,
+        derived_tags: Iterable[str] | str | None = None,
+        media_width: int | None = None,
+        media_height: int | None = None,
     ) -> AddMediaResult:
         content_fingerprint = normalize_fingerprint(content_fingerprint)
         content_hash = normalize_hash(content_hash)
@@ -351,6 +456,11 @@ class Store:
         video_width = normalize_positive_int(video_width)
         video_height = normalize_positive_int(video_height)
         video_duration = normalize_positive_int(video_duration)
+        source_id = normalize_optional_text(source_id)
+        source_label = normalize_optional_text(source_label)
+        normalized_tags = normalize_tags(derived_tags)
+        media_width = normalize_positive_int(media_width) or video_width
+        media_height = normalize_positive_int(media_height) or video_height
         if self.is_published(media_type, file_unique_id, content_fingerprint, content_hash, visual_hash):
             return AddMediaResult(status="already_published")
 
@@ -377,9 +487,10 @@ class Store:
                     INSERT INTO media_items(
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
                         status, content_fingerprint, content_hash, visual_hash, priority,
-                        available_after_publish_count, video_width, video_height, video_duration
+                        available_after_publish_count, video_width, video_height, video_duration,
+                        source_id, source_label, derived_tags_json, media_width, media_height
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -397,6 +508,11 @@ class Store:
                         video_width,
                         video_height,
                         video_duration,
+                        source_id,
+                        source_label,
+                        json.dumps(normalized_tags, ensure_ascii=False),
+                        media_width,
+                        media_height,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -494,7 +610,9 @@ class Store:
         channel_message_id: int | None = None,
         media_item_id: int | None = None,
     ) -> bool:
-        now = utcnow_iso()
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat(timespec="seconds")
+        preview_eligible_at = (now_dt + timedelta(hours=self.get_int_setting("preview_delay_hours", 48))).isoformat(timespec="seconds")
         with self.connect() as connection:
             content_fingerprint = None
             content_hash = None
@@ -560,10 +678,20 @@ class Store:
                 """
                 UPDATE media_items
                 SET status = ?, published_at = ?, channel_message_id = COALESCE(?, channel_message_id),
-                    error = NULL
+                    error = NULL,
+                    preview_eligible_at = CASE
+                        WHEN media_type = 'photo' THEN COALESCE(preview_eligible_at, ?)
+                        ELSE NULL
+                    END
                 WHERE file_unique_id = ?
                 """,
-                (PUBLISHED, now, channel_message_id, file_unique_id),
+                (
+                    PUBLISHED,
+                    now,
+                    channel_message_id,
+                    preview_eligible_at,
+                    file_unique_id,
+                ),
             )
             if is_new:
                 connection.execute(
@@ -671,6 +799,301 @@ class Store:
                 position=position,
                 planned_posts=int(plan["planned_posts"]),
             )
+
+    def list_preview_candidates(self, eligible_at: str, limit: int = 100) -> list[MediaItem]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM media_items
+                WHERE status = ?
+                  AND media_type = ?
+                  AND preview_eligible_at IS NOT NULL
+                  AND preview_eligible_at <= ?
+                  AND preview_published_at IS NULL
+                ORDER BY preview_eligible_at ASC, published_at ASC, id ASC
+                LIMIT ?
+                """,
+                (PUBLISHED, PHOTO, eligible_at, max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_media_item(row) for row in rows]
+
+    def preview_history_between(self, start_at: str, end_at: str) -> list[MediaItem]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM media_items
+                WHERE preview_published_at >= ? AND preview_published_at < ?
+                ORDER BY preview_published_at ASC, id ASC
+                """,
+                (start_at, end_at),
+            ).fetchall()
+        return [self._row_to_media_item(row) for row in rows]
+
+    def latest_preview_item(self) -> MediaItem | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM media_items
+                WHERE preview_published_at IS NOT NULL
+                ORDER BY preview_published_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._row_to_media_item(row) if row else None
+
+    def get_or_assign_preview_notification_policy(
+        self,
+        media_item_id: int,
+        local_date: str,
+    ) -> NotificationPolicy:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            item = connection.execute(
+                """
+                SELECT preview_notification_silent, preview_notification_local_date,
+                       preview_notification_position
+                FROM media_items
+                WHERE id = ?
+                """,
+                (media_item_id,),
+            ).fetchone()
+            if item is None:
+                raise ValueError(f"Media item {media_item_id} non trovato")
+
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO preview_day_plans(local_date, next_position, audible_reserved)
+                VALUES(?, 0, 0)
+                """,
+                (local_date,),
+            )
+            if item["preview_notification_silent"] is not None:
+                silent = bool(item["preview_notification_silent"])
+                if not silent:
+                    connection.execute(
+                        """
+                        UPDATE preview_day_plans
+                        SET audible_reserved = 1
+                        WHERE local_date = ?
+                        """,
+                        (local_date,),
+                    )
+                return NotificationPolicy(
+                    silent=silent,
+                    local_date=str(item["preview_notification_local_date"]),
+                    position=int(item["preview_notification_position"]),
+                    planned_posts=2,
+                )
+
+            plan = connection.execute(
+                "SELECT next_position, audible_reserved FROM preview_day_plans WHERE local_date = ?",
+                (local_date,),
+            ).fetchone()
+            position = int(plan["next_position"]) + 1
+            audible = int(plan["audible_reserved"]) == 0
+            connection.execute(
+                """
+                UPDATE preview_day_plans
+                SET next_position = ?, audible_reserved = audible_reserved + ?
+                WHERE local_date = ?
+                """,
+                (position, 1 if audible else 0, local_date),
+            )
+            connection.execute(
+                """
+                UPDATE media_items
+                SET preview_notification_silent = ?, preview_notification_local_date = ?,
+                    preview_notification_position = ?
+                WHERE id = ?
+                """,
+                (0 if audible else 1, local_date, position, media_item_id),
+            )
+            return NotificationPolicy(
+                silent=not audible,
+                local_date=local_date,
+                position=position,
+                planned_posts=2,
+            )
+
+    def mark_preview_published(
+        self,
+        media_item_id: int,
+        message_id: int,
+        published_at: str | None = None,
+        variant: str = "full_photo",
+        memberpass_link_version: str | None = None,
+    ) -> None:
+        link_version = memberpass_link_version or self.get_setting("preview_memberpass_link_version", "v1") or "v1"
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE media_items
+                SET preview_published_at = ?, preview_message_id = ?, preview_variant = ?,
+                    preview_memberpass_link_version = ?, preview_error = NULL
+                WHERE id = ? AND preview_published_at IS NULL
+                """,
+                (published_at or utcnow_iso(), message_id, variant, link_version, media_item_id),
+
+            )
+    def mark_preview_failed(self, media_item_id: int, error: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE media_items
+                SET preview_failed_attempts = preview_failed_attempts + 1, preview_error = ?
+                WHERE id = ?
+                """,
+                (error[:1000], media_item_id),
+            )
+
+    def premium_count_between(self, start_at: str, end_at: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM publish_log WHERE published_at >= ? AND published_at < ?",
+                (start_at, end_at),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def preview_count_between(self, start_at: str, end_at: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM media_items
+                WHERE preview_published_at >= ? AND preview_published_at < ?
+                """,
+                (start_at, end_at),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def preview_count(self) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM media_items WHERE preview_published_at IS NOT NULL"
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def latest_preview_timestamps(self, limit: int) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT preview_published_at FROM media_items
+                WHERE preview_published_at IS NOT NULL
+                ORDER BY preview_published_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [str(row["preview_published_at"]) for row in reversed(rows)]
+
+    def published_photo_ids_between(self, start_at: str, end_at: str, limit: int = 12) -> tuple[int, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM media_items
+                WHERE status = ? AND media_type = ? AND published_at >= ? AND published_at < ?
+                ORDER BY published_at DESC, id DESC
+                LIMIT ?
+                """,
+                (PUBLISHED, PHOTO, start_at, end_at, max(1, int(limit))),
+            ).fetchall()
+        return tuple(int(row["id"]) for row in reversed(rows))
+
+    def create_preview_conversion_event(
+        self,
+        kind: str,
+        event_key: str,
+        eligible_at: str,
+        start_at: str,
+        end_at: str,
+        premium_count: int,
+        preview_count: int,
+        media_item_ids: Iterable[int],
+        memberpass_link_version: str,
+    ) -> PreviewConversionEvent:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO preview_conversion_events(
+                    kind, event_key, eligible_at, start_at, end_at, premium_count,
+                    preview_count, media_item_ids_json, memberpass_link_version
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    kind,
+                    event_key,
+                    eligible_at,
+                    start_at,
+                    end_at,
+                    max(0, int(premium_count)),
+                    max(0, int(preview_count)),
+                    json.dumps([int(value) for value in media_item_ids]),
+                    memberpass_link_version,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM preview_conversion_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+        return self._row_to_preview_event(row)
+
+    def pending_preview_conversion_events(self, eligible_at: str) -> list[PreviewConversionEvent]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM preview_conversion_events
+                WHERE status = 'pending' AND eligible_at <= ?
+                ORDER BY eligible_at ASC, id ASC
+                """,
+                (eligible_at,),
+            ).fetchall()
+        return [self._row_to_preview_event(row) for row in rows]
+
+    def mark_preview_conversion_sent(self, event_id: int, message_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preview_conversion_events
+                SET status = 'sent', message_id = ?, error = NULL
+                WHERE id = ?
+                """,
+                (message_id, event_id),
+            )
+
+    def mark_preview_conversion_failed(self, event_id: int, error: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preview_conversion_events
+                SET attempts = attempts + 1, error = ?
+                WHERE id = ?
+                """,
+                (error[:1000], event_id),
+            )
+
+    @staticmethod
+    def _row_to_preview_event(row: sqlite3.Row) -> PreviewConversionEvent:
+        try:
+            media_ids = tuple(int(value) for value in json.loads(row["media_item_ids_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            media_ids = ()
+        return PreviewConversionEvent(
+            id=int(row["id"]),
+            kind=str(row["kind"]),
+            event_key=str(row["event_key"]),
+            status=str(row["status"]),
+            eligible_at=str(row["eligible_at"]),
+            start_at=str(row["start_at"]),
+            end_at=str(row["end_at"]),
+            premium_count=int(row["premium_count"]),
+            preview_count=int(row["preview_count"]),
+            media_item_ids=media_ids,
+            memberpass_link_version=str(row["memberpass_link_version"]),
+            message_id=optional_int(row, "message_id"),
+            attempts=int(row["attempts"]),
+            error=row["error"],
+        )
 
     def mark_removed(self, media_item_id: int) -> bool:
         with self.connect() as connection:
@@ -878,6 +1301,38 @@ class Store:
                 row["notification_local_date"] if "notification_local_date" in row.keys() else None
             ),
             notification_position=optional_int(row, "notification_position"),
+            source_id=row["source_id"] if "source_id" in row.keys() else None,
+            source_label=row["source_label"] if "source_label" in row.keys() else None,
+            derived_tags=parse_tags(row["derived_tags_json"] if "derived_tags_json" in row.keys() else None),
+            media_width=optional_int(row, "media_width"),
+            media_height=optional_int(row, "media_height"),
+            preview_eligible_at=(row["preview_eligible_at"] if "preview_eligible_at" in row.keys() else None),
+            preview_published_at=(row["preview_published_at"] if "preview_published_at" in row.keys() else None),
+            preview_message_id=optional_int(row, "preview_message_id"),
+            preview_variant=(row["preview_variant"] if "preview_variant" in row.keys() else None),
+            preview_memberpass_link_version=(
+                row["preview_memberpass_link_version"]
+                if "preview_memberpass_link_version" in row.keys()
+                else None
+            ),
+            preview_notification_silent=(
+                bool(row["preview_notification_silent"])
+                if "preview_notification_silent" in row.keys()
+                and row["preview_notification_silent"] is not None
+                else None
+            ),
+            preview_notification_local_date=(
+                row["preview_notification_local_date"]
+                if "preview_notification_local_date" in row.keys()
+                else None
+            ),
+            preview_notification_position=optional_int(row, "preview_notification_position"),
+            preview_failed_attempts=(
+                int(row["preview_failed_attempts"] or 0)
+                if "preview_failed_attempts" in row.keys()
+                else 0
+            ),
+            preview_error=row["preview_error"] if "preview_error" in row.keys() else None,
         )
 
 
@@ -905,6 +1360,37 @@ def normalize_positive_int(value: int | str | None) -> int | None:
     except (TypeError, ValueError):
         return None
     return normalized if normalized > 0 else None
+
+
+def normalize_optional_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized[:500] or None
+
+
+def normalize_tags(value: Iterable[str] | str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_values: Iterable[object]
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value.replace(";", ",").split(",")
+        raw_values = decoded if isinstance(decoded, list) else [decoded]
+    else:
+        raw_values = value
+    tags: list[str] = []
+    for raw in raw_values:
+        tag = str(raw).strip().lower()
+        if tag and tag not in tags:
+            tags.append(tag[:100])
+    return tuple(tags[:20])
+
+
+def parse_tags(value: str | None) -> tuple[str, ...]:
+    return normalize_tags(value)
 
 
 def optional_int(row: sqlite3.Row, key: str) -> int | None:

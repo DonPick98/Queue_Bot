@@ -253,6 +253,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         content_fingerprint = str(form.getfirst("content_fingerprint") or "").strip() or None
         content_hash = str(form.getfirst("content_hash") or "").strip() or hashlib.sha256(content).hexdigest()
         visual_hash = str(form.getfirst("visual_hash") or "").strip() or None
+        source_id = str(form.getfirst("source_id") or "").strip() or None
+        source_label = str(form.getfirst("source_label") or "").strip() or None
+        derived_tags = str(form.getfirst("derived_tags") or "").strip() or None
         try:
             priority = max(0, int(str(form.getfirst("priority") or "0").strip() or "0"))
         except ValueError:
@@ -307,6 +310,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             video_width=video_width,
             video_height=video_height,
             video_duration=video_duration,
+            source_id=source_id,
+            source_label=source_label,
+            derived_tags=derived_tags,
+            media_width=telegram_media.get("width"),
+            media_height=telegram_media.get("height"),
         )
 
         if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:

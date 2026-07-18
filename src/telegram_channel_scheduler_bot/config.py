@@ -117,6 +117,15 @@ class AppConfig:
     backup_auto_restore_if_empty: bool
     backup_before_shutdown_enabled: bool
     backup_telegram_auto_download_enabled: bool
+    preview_channel_id: str | None = None
+    preview_delay_hours: int = 48
+    preview_posts_per_day: int = 2
+    preview_posting_times: str = "10:00,20:00"
+    preview_memberpass_url: str = "https://my.memberpass.net/306354e7c4"
+    preview_memberpass_link_version: str = "v1"
+    preview_attribution: str = "@MouthPreview · Full daily feed ↓"
+    preview_recap_weekday: int = 6
+    preview_recap_time: str = "21:00"
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -155,4 +164,25 @@ class AppConfig:
             backup_auto_restore_if_empty=_bool("BACKUP_AUTO_RESTORE_IF_EMPTY", True),
             backup_before_shutdown_enabled=_bool("BACKUP_BEFORE_SHUTDOWN_ENABLED", True),
             backup_telegram_auto_download_enabled=_bool("BACKUP_TELEGRAM_AUTO_DOWNLOAD_ENABLED", True),
+            preview_channel_id=os.getenv("PREVIEW_CHANNEL_ID", "").strip() or None,
+            preview_delay_hours=_positive_int("PREVIEW_DELAY_HOURS", 48),
+            preview_posts_per_day=_positive_int("PREVIEW_POSTS_PER_DAY", 2),
+            preview_posting_times=os.getenv("PREVIEW_POSTING_TIMES", "10:00,20:00").strip()
+            or "10:00,20:00",
+            preview_memberpass_url=os.getenv(
+                "PREVIEW_MEMBERPASS_URL",
+                "https://my.memberpass.net/306354e7c4",
+            ).strip(),
+            preview_memberpass_link_version=os.getenv(
+                "PREVIEW_MEMBERPASS_LINK_VERSION",
+                "v1",
+            ).strip()
+            or "v1",
+            preview_attribution=os.getenv(
+                "PREVIEW_ATTRIBUTION",
+                "@MouthPreview · Full daily feed ↓",
+            ).strip()
+            or "@MouthPreview · Full daily feed ↓",
+            preview_recap_weekday=int(os.getenv("PREVIEW_RECAP_WEEKDAY", "6")),
+            preview_recap_time=os.getenv("PREVIEW_RECAP_TIME", "21:00").strip() or "21:00",
         )

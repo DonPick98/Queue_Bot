@@ -202,6 +202,37 @@ Su host senza storage persistente conviene anche inviare il backup su Telegram:
 /set_publish_backup telegram
 ```
 
+## Mouth Preview
+
+Mouth Preview e un flusso separato dal canale Premium:
+
+- pubblica solo immagini, mai video;
+- massimo 2 immagini al giorno, come post Telegram individuali;
+- usa foto gia pubblicate in Premium da almeno 48 ore;
+- evita di ripetere la stessa sorgente nello stesso giorno;
+- invia la prima foto con notifica normale e la seconda silenziosa;
+- mantiene silenziosi welcome, upgrade card e recap settimanale;
+- crea una upgrade card ogni 6 anteprime e un mosaic settimanale con conteggi reali.
+
+Configurazione predefinita:
+
+```env
+PREVIEW_CHANNEL_ID=
+PREVIEW_DELAY_HOURS=48
+PREVIEW_POSTS_PER_DAY=2
+PREVIEW_POSTING_TIMES=10:00,20:00
+PREVIEW_MEMBERPASS_URL=https://my.memberpass.net/306354e7c4
+PREVIEW_MEMBERPASS_LINK_VERSION=v1
+PREVIEW_RECAP_WEEKDAY=6
+PREVIEW_RECAP_TIME=21:00
+```
+
+Lascia `PREVIEW_CHANNEL_ID` vuoto fino a quando il bot non e amministratore del canale.
+Concedi i permessi per pubblicare e fissare messaggi, poi invia al bot in privato:
+
+```text
+/set_preview_channel @MouthPreview
+```
 ## Deploy cloud
 
 Il progetto include anche supporto per deploy container su JustRunMy.App:
