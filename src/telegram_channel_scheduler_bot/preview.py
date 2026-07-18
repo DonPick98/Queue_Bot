@@ -27,6 +27,7 @@ PREVIEW_MOSAIC_LIMIT = 12
 PREVIEW_WATERMARK_MAX_DIMENSION = 2560
 
 PREVIEW_WELCOME_COPY_VERSION = "en-v1"
+REDDIT_CREATOR_CREDIT_RE = re.compile(r"u/[A-Za-z0-9_-]{3,20}")
 
 
 def utcnow() -> datetime:
@@ -88,6 +89,14 @@ def technical_quality(item: MediaItem) -> tuple[int, int]:
     aspect_score = 0 if ratio > 3.0 else 1 if ratio > 2.2 else 2
     resolution_score = 2 if pixels >= 1_000_000 else 1 if pixels >= 400_000 else 0
     return aspect_score, resolution_score
+
+
+def preview_creator_credit(item: MediaItem) -> str | None:
+    source_id = str(item.source_id or "").strip().lower()
+    caption = str(item.caption_html or "").strip()
+    if source_id.startswith("reddit:") and REDDIT_CREATOR_CREDIT_RE.fullmatch(caption):
+        return caption
+    return None
 
 
 class PreviewEligibilityService:
@@ -353,10 +362,12 @@ class PreviewPublisher:
             policy = self.store.get_or_assign_preview_notification_policy(item.id, local_date)
             try:
                 photo = await prepare_preview_photo(application, self.store, item)
+                creator_credit = preview_creator_credit(item)
                 sent = await application.bot.send_photo(
                     chat_id=channel_id,
                     photo=photo,
                     disable_notification=policy.silent,
+                    **({"caption": creator_credit} if creator_credit else {}),
                 )
             except (TelegramError, OSError, ValueError) as exc:
                 self.store.mark_preview_failed(item.id, str(exc))
@@ -404,10 +415,12 @@ class PreviewPublisher:
                 item,
                 staging_chat_id=staging_chat_id,
             )
+            creator_credit = preview_creator_credit(item)
             sent = await application.bot.send_photo(
                 chat_id=channel_id,
                 photo=photo,
                 disable_notification=policy.silent,
+                **({"caption": creator_credit} if creator_credit else {}),
             )
         except (TelegramError, OSError, ValueError) as exc:
             self.store.mark_preview_failed(item.id, str(exc))
