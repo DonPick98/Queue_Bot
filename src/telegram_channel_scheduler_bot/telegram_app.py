@@ -40,6 +40,7 @@ from .posting_plan import (
     initial_next_publish_at,
     seconds_until_next_publish,
 )
+from .preview import ensure_preview_welcome, schedule_preview
 from .queue_order import parse_queue_order
 from .scheduling import (
     DEFAULT_TIMEZONE,
@@ -90,6 +91,8 @@ class ExtractedMedia:
     video_width: int | None = None
     video_height: int | None = None
     video_duration: int | None = None
+    media_width: int | None = None
+    media_height: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,8 @@ def extract_media(message: Message) -> ExtractedMedia | None:
             file_id=photo.file_id,
             file_unique_id=photo.file_unique_id,
             caption_html=message.caption_html if message.caption else None,
+            media_width=photo.width,
+            media_height=photo.height,
         )
     if message.video:
         video = message.video
@@ -118,6 +123,8 @@ def extract_media(message: Message) -> ExtractedMedia | None:
             video_width=video.width,
             video_height=video.height,
             video_duration=video.duration,
+            media_width=video.width,
+            media_height=video.height,
         )
     return None
 
@@ -444,6 +451,7 @@ def build_help_text() -> str:
         "/queue - mostra i prossimi elementi in coda\n"
         "/set_channel @canale - imposta il canale di destinazione\n"
         "/set_channel_here - da scrivere nel canale privato per impostarlo\n"
+        "/set_preview_channel @canale - attiva Mouth Preview (solo immagini)\n"
         "/channel_id - da scrivere nel canale privato per vedere il suo ID\n"
         "/dashboard - pannello con bottoni\n"
         "/set_interval 2h - imposta ogni quanto pubblicare\n"
@@ -908,6 +916,37 @@ async def set_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def set_preview_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Uso: /set_preview_channel @nome_canale oppure /set_preview_channel -100..."
+        )
+        return
+
+    channel_id = context.args[0].strip()
+    store = get_store(context)
+    previous_channel_id = store.get_setting("preview_channel_id", "") or ""
+    try:
+        chat = await context.bot.get_chat(channel_id)
+        store.set_setting("preview_channel_id", channel_id)
+        await ensure_preview_welcome(context.application, store, force=True)
+    except TelegramError as exc:
+        store.set_setting("preview_channel_id", previous_channel_id)
+        await update.effective_message.reply_text(
+            "Non riesco a configurare Mouth Preview. Aggiungi prima il bot come amministratore "
+            "con permessi per pubblicare e fissare messaggi.\n"
+            f"Errore: {exc}"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"Mouth Preview attivato su {chat.title or channel_id}: 2 immagini al giorno, "
+        "ritardo 48 ore, prima notifica normale e seconda silenziosa. I video restano solo Premium."
+    )
+
+
 async def set_interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
@@ -974,6 +1013,7 @@ async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYP
     store.set_setting("timezone", timezone_name)
     next_publish_at = get_or_initialize_next_publish_at(store)
     schedule_publisher(context.application, store)
+    schedule_preview(context.application, store)
     await update.effective_message.reply_text(
         f"Timezone aggiornata: {timezone_name}.\n"
         f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}."
@@ -1512,6 +1552,8 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         video_width=media.video_width,
         video_height=media.video_height,
         video_duration=media.video_duration,
+        media_width=media.media_width,
+        media_height=media.media_height,
     )
     await message.reply_text(format_add_result(result))
     await check_queue_coverage_alert(context.application, notify=False)
@@ -1865,6 +1907,7 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("queue", queue_command))
     application.add_handler(CommandHandler("set_channel", set_channel_command))
+    application.add_handler(CommandHandler("set_preview_channel", set_preview_channel_command))
     application.add_handler(CommandHandler("set_interval", set_interval_command))
     application.add_handler(CommandHandler("set_next", set_next_command))
     application.add_handler(CommandHandler("set_timezone", set_timezone_command))
@@ -1889,6 +1932,7 @@ def build_application(config: AppConfig) -> Application:
 
     schedule_publisher(application, store)
     schedule_auto_backup(application, store)
+    schedule_preview(application, store)
     return application
 
 
