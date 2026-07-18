@@ -126,12 +126,13 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         *,
         media_type: str = "photo",
         source_id: str | None = None,
+        caption_html: str | None = None,
     ):
         result = store.add_media(
             media_type,
             f"file-{index}",
             f"unique-{index}",
-            None,
+            caption_html,
             1,
             source_id=source_id or f"source-{index}",
             source_label=source_id or f"Source {index}",
@@ -217,6 +218,30 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("file-4", bot.downloaded_file_ids)
         self.assertTrue(all("caption" not in call for call in bot.photos))
         self.assertTrue(all(isinstance(call["photo"], BytesIO) for call in bot.photos))
+
+    async def test_preview_credits_only_reddit_creator_username(self):
+        store = self.make_store()
+        self.add_published(
+            store,
+            1,
+            source_id="reddit:r-example",
+            caption_html="u/Creator_Name-7",
+        )
+        self.add_published(
+            store,
+            2,
+            source_id="pinterest:example",
+            caption_html="u/not-a-reddit-credit",
+        )
+        bot = FakePreviewBot()
+
+        await PreviewPublisher(store).publish_due(
+            SimpleNamespace(bot=bot),
+            datetime(2026, 7, 13, 19, 0, tzinfo=UTC),
+        )
+
+        captions = {call.get("caption") for call in bot.photos}
+        self.assertEqual(captions, {"u/Creator_Name-7", None})
 
     async def test_preview_notification_choice_survives_retry(self):
         store = self.make_store()
