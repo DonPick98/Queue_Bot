@@ -126,7 +126,8 @@ class AppConfig:
     preview_attribution: str = "@MouthPreview · Full daily feed ↓"
     preview_watermark_enabled: bool = True
     preview_watermark_text: str = "@MouthPreview"
-    preview_watermark_opacity: int = 82
+    preview_watermark_opacity: int = 64
+    preview_watermark_scale_percent: int = 10
     preview_recap_weekday: int = 6
     preview_recap_time: str = "21:00"
 
@@ -192,7 +193,11 @@ class AppConfig:
                 "@MouthPreview",
             ).strip()
             or "@MouthPreview",
-            preview_watermark_opacity=max(24, min(160, _positive_int("PREVIEW_WATERMARK_OPACITY", 82))),
+            preview_watermark_opacity=max(24, min(160, _positive_int("PREVIEW_WATERMARK_OPACITY", 64))),
+            preview_watermark_scale_percent=max(
+                3,
+                min(18, _positive_int("PREVIEW_WATERMARK_SCALE_PERCENT", 10)),
+            ),
             preview_recap_weekday=int(os.getenv("PREVIEW_RECAP_WEEKDAY", "6")),
             preview_recap_time=os.getenv("PREVIEW_RECAP_TIME", "21:00").strip() or "21:00",
         )
