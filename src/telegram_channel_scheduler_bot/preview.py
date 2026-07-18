@@ -24,6 +24,8 @@ PREVIEW_MAX_POSTS_PER_DAY = 2
 PREVIEW_UPGRADE_FREQUENCY = 6
 PREVIEW_MOSAIC_LIMIT = 12
 
+PREVIEW_WELCOME_COPY_VERSION = "en-v1"
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -133,30 +135,30 @@ def upgrade_keyboard(url: str) -> InlineKeyboardMarkup:
 def welcome_text() -> str:
     return (
         "🍓 <b>Welcome to Mouth Preview</b>\n\n"
-        "Riceverai due immagini selezionate ogni giorno, 48 ore dopo la pubblicazione Premium.\n\n"
-        "Mouth Preview non pubblica video. Berry Premium riceve subito il feed completo: "
-        "12+ foto e video ogni giorno.\n\n"
-        "Primo mese: <b>$1</b>\nPoi: <b>$3/mese</b> · annulla quando vuoi"
+        "You'll get two hand-picked images every day, 48 hours after they appear in Premium.\n\n"
+        "Mouth Preview does not publish videos. Berry Premium gets the complete feed immediately: "
+        "12+ photos and videos every day.\n\n"
+        "First month: <b>$1</b>\nThen: <b>$3/month</b> · cancel anytime"
     )
 
 
 def upgrade_text(event: PreviewConversionEvent) -> str:
     return (
-        f"Hai visto {event.preview_count} anteprime. Nello stesso periodo Berry Premium ha "
-        f"pubblicato {event.premium_count} contenuti.\n\n"
-        "Mouth Preview pubblica solo immagini; in Premium trovi il feed completo, "
-        "incluse tutte le foto e tutti i video, senza il ritardo di 48 ore.\n\n"
-        "Prova tutto per <b>$1</b> ↓"
+        f"You've seen {event.preview_count} previews. During the same period, Berry Premium "
+        f"published {event.premium_count} posts.\n\n"
+        "Mouth Preview is images only. Premium includes the complete feed: all photos and videos, "
+        "without the 48-hour delay.\n\n"
+        "Try the full feed for <b>$1</b> ↓"
     )
 
 
 def recap_text(event: PreviewConversionEvent) -> str:
     return (
-        "<b>Questa settimana in Berry Premium</b>\n\n"
-        f"Premium ha pubblicato {event.premium_count} foto e video. "
-        f"Preview ha ricevuto {event.preview_count} immagini.\n\n"
-        "I video non vengono pubblicati in Mouth Preview. Ottieni il feed completo, "
-        "immediato, per <b>$1</b>."
+        "<b>This week in Berry Premium</b>\n\n"
+        f"Premium published {event.premium_count} photos and videos. "
+        f"Preview received {event.preview_count} images.\n\n"
+        "Videos are not published in Mouth Preview. Get the complete feed immediately "
+        "for <b>$1</b>."
     )
 
 
@@ -362,8 +364,10 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
     if not channel_id:
         return None
     link_version = store.get_setting("preview_memberpass_link_version", "v1") or "v1"
+    welcome_version = f"{PREVIEW_WELCOME_COPY_VERSION}:{link_version}"
+    previous_message_id = store.get_setting("preview_welcome_message_id")
     if not force and store.get_setting("preview_welcome_message_id") and (
-        store.get_setting("preview_welcome_link_version") == link_version
+        store.get_setting("preview_welcome_version") == welcome_version
     ):
         return None
     message = await application.bot.send_message(
@@ -382,7 +386,18 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
         disable_notification=True,
     )
     store.set_setting("preview_welcome_message_id", str(message.message_id))
-    store.set_setting("preview_welcome_link_version", link_version)
+    store.set_setting("preview_welcome_version", welcome_version)
+    if previous_message_id and previous_message_id != str(message.message_id):
+        try:
+            await application.bot.delete_message(
+                chat_id=channel_id,
+                message_id=int(previous_message_id),
+            )
+        except (TelegramError, ValueError):
+            LOGGER.warning(
+                "Could not remove the previous Mouth Preview welcome message",
+                exc_info=True,
+            )
     LOGGER.info("Published and pinned Mouth Preview welcome message")
     return message
 
