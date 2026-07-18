@@ -13,6 +13,10 @@ from telegram_channel_scheduler_bot.preview import (
     PreviewEligibilityService,
     PreviewPublisher,
     PreviewSelector,
+    WeeklyPreviewRecap,
+    build_watermarked_photo,
+    preview_welcome_version,
+    set_preview_welcome,
     build_mosaic,
     due_preview_slots,
     ensure_preview_welcome,
@@ -23,14 +27,32 @@ from telegram_channel_scheduler_bot.preview import (
 from telegram_channel_scheduler_bot.storage import Store
 
 
+class FakeTelegramFile:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    async def download_as_bytearray(self):
+        return bytearray(self.content)
+
+
 class FakePreviewBot:
     def __init__(self) -> None:
         self.photos: list[dict[str, object]] = []
         self.failures_remaining: dict[str, int] = {}
+        self.last_file_id = ""
+        self.downloaded_file_ids: list[str] = []
+        source = BytesIO()
+        Image.new("RGB", (1200, 1600), "#7d657d").save(source, format="JPEG")
+        self.photo_content = source.getvalue()
+
+    async def get_file(self, file_id: str):
+        self.last_file_id = file_id
+        self.downloaded_file_ids.append(file_id)
+        return FakeTelegramFile(self.photo_content)
 
     async def send_photo(self, **kwargs):
         self.photos.append(kwargs)
-        file_id = str(kwargs["photo"])
+        file_id = self.last_file_id or str(kwargs["photo"])
         if self.failures_remaining.get(file_id, 0):
             self.failures_remaining[file_id] -= 1
             raise TelegramError("temporary preview failure")
@@ -145,7 +167,9 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot.pins[0]["disable_notification"])
         self.assertEqual(bot.deletions[0]["message_id"], 144)
         self.assertEqual(store.get_setting("preview_welcome_message_id"), "2001")
-        self.assertEqual(store.get_setting("preview_welcome_version"), "en-v1:v1")
+        stored_version = store.get_setting("preview_welcome_version")
+        self.assertEqual(stored_version, preview_welcome_version(store))
+        self.assertTrue(stored_version.startswith("en-v1:v1:default:"))
 
     async def test_preview_publishes_two_individual_photos_and_never_video(self):
         store = self.make_store()
@@ -167,7 +191,9 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             [call["disable_notification"] for call in bot.photos],
             [False, True],
         )
-        self.assertNotIn("file-4", [call["photo"] for call in bot.photos])
+        self.assertNotIn("file-4", bot.downloaded_file_ids)
+        self.assertTrue(all("caption" not in call for call in bot.photos))
+        self.assertTrue(all(isinstance(call["photo"], BytesIO) for call in bot.photos))
 
     async def test_preview_notification_choice_survives_retry(self):
         store = self.make_store()
@@ -238,6 +264,76 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         mosaic = build_mosaic(images, tile_size=100)
         with Image.open(mosaic) as rendered:
             self.assertEqual(rendered.size, (300, 200))
+
+
+    def test_watermark_is_subtle_bottom_left_and_limits_working_size(self):
+        source = BytesIO()
+        Image.new("RGB", (3000, 2000), (125, 125, 125)).save(source, format="JPEG")
+
+        output = build_watermarked_photo(
+            source.getvalue(),
+            text="@MouthPreview",
+            opacity=82,
+            max_dimension=1000,
+        )
+
+        with Image.open(output) as rendered:
+            self.assertEqual(rendered.size, (1000, 667))
+            extrema = rendered.convert("L").getextrema()
+            self.assertLess(extrema[0], 110)
+            self.assertGreater(extrema[1], 145)
+            self.assertAlmostEqual(rendered.getpixel((950, 40))[0], 125, delta=8)
+
+
+    def test_watermark_stays_bottom_left_across_aspect_ratios(self):
+        for size in ((800, 1200), (1200, 800), (900, 900), (180, 1200)):
+            with self.subTest(size=size):
+                source = BytesIO()
+                Image.new("RGB", size, (125, 125, 125)).save(source, format="JPEG")
+
+                output = build_watermarked_photo(source.getvalue(), max_dimension=1600)
+                with Image.open(output) as rendered:
+                    width, height = rendered.size
+                    grayscale = rendered.convert("L")
+                    lower_left = grayscale.crop((0, int(height * 0.55), int(width * 0.72), height))
+                    self.assertLess(lower_left.getextrema()[0], 110)
+                    self.assertGreater(lower_left.getextrema()[1], 145)
+                    self.assertAlmostEqual(grayscale.getpixel((width - 20, 20)), 125, delta=8)
+    async def test_custom_welcome_is_plain_text_with_memberpass_button(self):
+        store = self.make_store()
+        set_preview_welcome(store, "custom", "Custom <b>plain</b> welcome")
+        bot = FakeWelcomeBot()
+
+        await ensure_preview_welcome(SimpleNamespace(bot=bot), store, force=True)
+
+        self.assertEqual(bot.messages[0]["text"], "Custom <b>plain</b> welcome")
+        self.assertIsNone(bot.messages[0]["parse_mode"])
+        self.assertIsNotNone(bot.messages[0]["reply_markup"])
+        self.assertIn(":custom:", store.get_setting("preview_welcome_version"))
+
+    async def test_forced_weekly_recap_uses_real_counts_and_prevents_duplicate(self):
+        store = self.make_store()
+        items = [self.add_published(store, index) for index in range(1, 4)]
+        now = datetime.now(UTC)
+        store.mark_preview_published(
+            items[0].id,
+            3001,
+            now.isoformat(timespec="seconds"),
+        )
+        bot = FakePreviewBot()
+        app = SimpleNamespace(bot=bot)
+
+        message, event = await WeeklyPreviewRecap(store).force_send(app, now=now)
+        repeated_message, repeated_event = await WeeklyPreviewRecap(store).force_send(app, now=now)
+
+        self.assertIsNotNone(message)
+        self.assertEqual(event.premium_count, 3)
+        self.assertEqual(event.preview_count, 1)
+        self.assertIn("Premium published 3 photos and videos", bot.photos[0]["caption"])
+        self.assertTrue(bot.photos[0]["disable_notification"])
+        self.assertIsNone(repeated_message)
+        self.assertEqual(repeated_event.event_key, event.event_key)
+        self.assertEqual(len(bot.photos), 1)
 
 
 if __name__ == "__main__":

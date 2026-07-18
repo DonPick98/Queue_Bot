@@ -124,6 +124,9 @@ class AppConfig:
     preview_memberpass_url: str = "https://my.memberpass.net/306354e7c4"
     preview_memberpass_link_version: str = "v1"
     preview_attribution: str = "@MouthPreview · Full daily feed ↓"
+    preview_watermark_enabled: bool = True
+    preview_watermark_text: str = "@MouthPreview"
+    preview_watermark_opacity: int = 82
     preview_recap_weekday: int = 6
     preview_recap_time: str = "21:00"
 
@@ -183,6 +186,13 @@ class AppConfig:
                 "@MouthPreview · Full daily feed ↓",
             ).strip()
             or "@MouthPreview · Full daily feed ↓",
+            preview_watermark_enabled=_bool("PREVIEW_WATERMARK_ENABLED", True),
+            preview_watermark_text=os.getenv(
+                "PREVIEW_WATERMARK_TEXT",
+                "@MouthPreview",
+            ).strip()
+            or "@MouthPreview",
+            preview_watermark_opacity=max(24, min(160, _positive_int("PREVIEW_WATERMARK_OPACITY", 82))),
             preview_recap_weekday=int(os.getenv("PREVIEW_RECAP_WEEKDAY", "6")),
             preview_recap_time=os.getenv("PREVIEW_RECAP_TIME", "21:00").strip() or "21:00",
         )
