@@ -15,6 +15,10 @@ from telegram_channel_scheduler_bot.preview import (
     PreviewSelector,
     build_mosaic,
     due_preview_slots,
+    ensure_preview_welcome,
+    recap_text,
+    upgrade_text,
+    welcome_text,
 )
 from telegram_channel_scheduler_bot.storage import Store
 
@@ -31,6 +35,23 @@ class FakePreviewBot:
             self.failures_remaining[file_id] -= 1
             raise TelegramError("temporary preview failure")
         return SimpleNamespace(message_id=1000 + len(self.photos))
+
+
+class FakeWelcomeBot:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+        self.pins: list[dict[str, object]] = []
+        self.deletions: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs):
+        self.messages.append(kwargs)
+        return SimpleNamespace(message_id=2001)
+
+    async def pin_chat_message(self, **kwargs):
+        self.pins.append(kwargs)
+
+    async def delete_message(self, **kwargs):
+        self.deletions.append(kwargs)
 
 
 class PreviewTests(unittest.IsolatedAsyncioTestCase):
@@ -93,10 +114,38 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(eligible_at, datetime(2026, 7, 12, 12, 30, tzinfo=UTC))
 
+    def test_public_channel_copy_is_english(self):
+        event = SimpleNamespace(preview_count=6, premium_count=36)
+
+        self.assertIn("You'll get two hand-picked images", welcome_text())
+        self.assertIn("does not publish videos", welcome_text())
+        self.assertIn("You've seen 6 previews", upgrade_text(event))
+        self.assertIn("images only", upgrade_text(event))
+        self.assertIn("This week in Berry Premium", recap_text(event))
+        self.assertIn("Videos are not published in Mouth Preview", recap_text(event))
+
     def test_due_slots_follow_project_timezone(self):
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 7, 59, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 0)
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 8, 0, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 1)
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 18, 0, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 2)
+
+    async def test_english_welcome_replaces_previous_pinned_copy(self):
+        store = self.make_store()
+        store.set_setting("preview_welcome_message_id", "144")
+        store.set_setting("preview_welcome_link_version", "v1")
+        bot = FakeWelcomeBot()
+
+        message = await ensure_preview_welcome(SimpleNamespace(bot=bot), store)
+
+        self.assertEqual(message.message_id, 2001)
+        self.assertIn("Welcome to Mouth Preview", bot.messages[0]["text"])
+        self.assertNotIn("Riceverai", bot.messages[0]["text"])
+        self.assertTrue(bot.messages[0]["disable_notification"])
+        self.assertEqual(bot.pins[0]["message_id"], 2001)
+        self.assertTrue(bot.pins[0]["disable_notification"])
+        self.assertEqual(bot.deletions[0]["message_id"], 144)
+        self.assertEqual(store.get_setting("preview_welcome_message_id"), "2001")
+        self.assertEqual(store.get_setting("preview_welcome_version"), "en-v1:v1")
 
     async def test_preview_publishes_two_individual_photos_and_never_video(self):
         store = self.make_store()
