@@ -3,14 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from io import BytesIO
-import html
+import asyncio
+import hashlib
 import logging
 import math
 import re
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
@@ -23,6 +24,7 @@ PREVIEW_JOB_INTERVAL_SECONDS = 300
 PREVIEW_MAX_POSTS_PER_DAY = 2
 PREVIEW_UPGRADE_FREQUENCY = 6
 PREVIEW_MOSAIC_LIMIT = 12
+PREVIEW_WATERMARK_MAX_DIMENSION = 2560
 
 PREVIEW_WELCOME_COPY_VERSION = "en-v1"
 
@@ -162,6 +164,84 @@ def recap_text(event: PreviewConversionEvent) -> str:
     )
 
 
+def _watermark_font(size: int):
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except OSError:
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+
+def build_watermarked_photo(
+    content: bytes,
+    text: str = "@MouthPreview",
+    opacity: int = 82,
+    max_dimension: int = PREVIEW_WATERMARK_MAX_DIMENSION,
+) -> BytesIO:
+    max_dimension = max(720, int(max_dimension))
+    with Image.open(BytesIO(content)) as source:
+        source.draft("RGB", (max_dimension, max_dimension))
+        image = ImageOps.exif_transpose(source)
+        if max(image.size) > max_dimension:
+            image.thumbnail(
+                (max_dimension, max_dimension),
+                Image.Resampling.LANCZOS,
+                reducing_gap=3.0,
+            )
+        image = image.convert("RGBA")
+
+    width, height = image.size
+    font_size = max(18, min(52, round(min(width, height) * 0.034)))
+    padding = max(8, round(min(width, height) * 0.025))
+    font = _watermark_font(font_size)
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    label = text.strip() or "@MouthPreview"
+    bounds = draw.textbbox((0, 0), label, font=font)
+    while bounds[2] - bounds[0] > width - (2 * padding) and font_size > 8:
+        font_size = max(8, font_size - 2)
+        font = _watermark_font(font_size)
+        bounds = draw.textbbox((0, 0), label, font=font)
+    alpha = max(24, min(160, int(opacity)))
+    shadow = max(20, min(110, alpha))
+    shadow_offset = max(1, round(font_size * 0.06))
+    x = padding - bounds[0]
+    y = max(padding - bounds[1], height - padding - shadow_offset - bounds[3])
+    draw.text(
+        (x + shadow_offset, y + shadow_offset),
+        label,
+        font=font,
+        fill=(0, 0, 0, shadow),
+    )
+    draw.text((x, y), label, font=font, fill=(255, 255, 255, alpha))
+    rendered = Image.alpha_composite(image, overlay).convert("RGB")
+    output = BytesIO()
+    output.name = "mouth-preview.jpg"
+    rendered.save(output, format="JPEG", quality=90)
+    output.seek(0)
+    return output
+
+
+async def prepare_preview_photo(
+    application,
+    store: Store,
+    item: MediaItem,
+    force_watermark: bool = False,
+):
+    if not force_watermark and not store.get_bool_setting("preview_watermark_enabled", True):
+        return item.file_id
+    telegram_file = await application.bot.get_file(item.file_id)
+    content = bytes(await telegram_file.download_as_bytearray())
+    return await asyncio.to_thread(
+        build_watermarked_photo,
+        content,
+        store.get_setting("preview_watermark_text", "@MouthPreview") or "@MouthPreview",
+        store.get_int_setting("preview_watermark_opacity", 82),
+    )
+
+
 def build_mosaic(images: Iterable[bytes], tile_size: int = 360) -> BytesIO:
     prepared: list[Image.Image] = []
     for content in images:
@@ -219,16 +299,13 @@ class PreviewPublisher:
                 break
             policy = self.store.get_or_assign_preview_notification_policy(item.id, local_date)
             try:
+                photo = await prepare_preview_photo(application, self.store, item)
                 sent = await application.bot.send_photo(
                     chat_id=channel_id,
-                    photo=item.file_id,
-                    caption=html.escape(
-                        self.store.get_setting("preview_attribution", "@MouthPreview · Full daily feed ↓")
-                        or "@MouthPreview · Full daily feed ↓"
-                    ),
+                    photo=photo,
                     disable_notification=policy.silent,
                 )
-            except TelegramError as exc:
+            except (TelegramError, OSError, ValueError) as exc:
                 self.store.mark_preview_failed(item.id, str(exc))
                 LOGGER.warning("Mouth Preview photo %s failed", item.id, exc_info=True)
                 break
@@ -309,14 +386,14 @@ class PreviewConversionScheduler:
 class WeeklyPreviewRecap:
     store: Store
 
-    def ensure_event(self, now: datetime | None = None) -> PreviewConversionEvent | None:
+    def ensure_event(self, now: datetime | None = None, force: bool = False) -> PreviewConversionEvent | None:
         now = now or utcnow()
         timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
         zone = ZoneInfo(timezone_name)
         local = now.astimezone(zone)
         weekday = self.store.get_int_setting("preview_recap_weekday", 6)
         recap_at = parse_preview_times(self.store.get_setting("preview_recap_time", "21:00") or "21:00")[0]
-        if local.weekday() != weekday or local.time().replace(tzinfo=None) < recap_at:
+        if not force and (local.weekday() != weekday or local.time().replace(tzinfo=None) < recap_at):
             return None
         week_start_local = datetime.combine(local.date() - timedelta(days=6), time.min, tzinfo=zone)
         start_at = week_start_local.astimezone(UTC).isoformat()
@@ -358,13 +435,46 @@ class WeeklyPreviewRecap:
             disable_notification=True,
         )
 
+    async def force_send(self, application, now: datetime | None = None):
+        event = self.ensure_event(now=now, force=True)
+        if event is None:
+            return None, None
+        if event.status == "sent":
+            return None, event
+        message = await self.send_event(application, event)
+        self.store.mark_preview_conversion_sent(event.id, message.message_id)
+        LOGGER.info("Published forced Mouth Preview weekly recap %s", event.event_key)
+        return message, event
+
+
+
+def preview_welcome_payload(store: Store) -> tuple[str, str | None]:
+    mode = store.get_setting("preview_welcome_mode", "default") or "default"
+    custom_text = store.get_setting("preview_welcome_custom_text", "") or ""
+    if mode == "custom" and custom_text.strip():
+        return custom_text.strip(), None
+    return welcome_text(), "HTML"
+
+
+def preview_welcome_version(store: Store) -> str:
+    text, _ = preview_welcome_payload(store)
+    mode = store.get_setting("preview_welcome_mode", "default") or "default"
+    link_version = store.get_setting("preview_memberpass_link_version", "v1") or "v1"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"{PREVIEW_WELCOME_COPY_VERSION}:{link_version}:{mode}:{digest}"
+
+
+def set_preview_welcome(store: Store, mode: str, custom_text: str = "") -> None:
+    store.set_setting("preview_welcome_mode", mode)
+    store.set_setting("preview_welcome_custom_text", custom_text.strip() if mode == "custom" else "")
+
 
 async def ensure_preview_welcome(application, store: Store, force: bool = False):
     channel_id = store.get_setting("preview_channel_id")
     if not channel_id:
         return None
-    link_version = store.get_setting("preview_memberpass_link_version", "v1") or "v1"
-    welcome_version = f"{PREVIEW_WELCOME_COPY_VERSION}:{link_version}"
+    text, parse_mode = preview_welcome_payload(store)
+    welcome_version = preview_welcome_version(store)
     previous_message_id = store.get_setting("preview_welcome_message_id")
     if not force and store.get_setting("preview_welcome_message_id") and (
         store.get_setting("preview_welcome_version") == welcome_version
@@ -372,8 +482,8 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
         return None
     message = await application.bot.send_message(
         chat_id=channel_id,
-        text=welcome_text(),
-        parse_mode="HTML",
+        text=text,
+        parse_mode=parse_mode,
         reply_markup=upgrade_keyboard(
             store.get_setting("preview_memberpass_url", "https://my.memberpass.net/306354e7c4")
             or "https://my.memberpass.net/306354e7c4"

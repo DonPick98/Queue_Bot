@@ -332,8 +332,13 @@ class Store:
             "preview_memberpass_url": config.preview_memberpass_url,
             "preview_memberpass_link_version": config.preview_memberpass_link_version,
             "preview_attribution": config.preview_attribution,
+            "preview_watermark_enabled": "true" if config.preview_watermark_enabled else "false",
+            "preview_watermark_text": config.preview_watermark_text,
+            "preview_watermark_opacity": str(config.preview_watermark_opacity),
             "preview_recap_weekday": str(config.preview_recap_weekday),
             "preview_recap_time": config.preview_recap_time,
+            "preview_welcome_mode": "default",
+            "preview_welcome_custom_text": "",
         }
         if config.channel_id:
             defaults["channel_id"] = config.channel_id

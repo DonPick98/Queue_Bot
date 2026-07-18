@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -40,7 +40,13 @@ from .posting_plan import (
     initial_next_publish_at,
     seconds_until_next_publish,
 )
-from .preview import ensure_preview_welcome, schedule_preview
+from .preview import (
+    WeeklyPreviewRecap,
+    ensure_preview_welcome,
+    prepare_preview_photo,
+    schedule_preview,
+    set_preview_welcome,
+)
 from .queue_order import parse_queue_order
 from .scheduling import (
     DEFAULT_TIMEZONE,
@@ -70,6 +76,20 @@ MAX_POSTS_PER_RUN = 20
 MAX_PUBLISH_CANDIDATE_ATTEMPTS = 25
 X_EXPORT_COUNT = 3
 X_EXPORTED_SETTING = "x_exported_media_item_ids"
+PREVIEW_CUSTOM_WELCOME_ACTION = "preview_custom_welcome"
+BOT_COMMANDS = (
+    BotCommand("dashboard", "Apri il pannello di controllo"),
+    BotCommand("queue", "Mostra la coda"),
+    BotCommand("status", "Mostra lo stato completo"),
+    BotCommand("post_now", "Pubblica ora dalla coda"),
+    BotCommand("preview_pin_default", "Ripristina il pinned Preview inglese"),
+    BotCommand("preview_pin_custom", "Imposta un pinned Preview personalizzato"),
+    BotCommand("preview_test_watermark", "Prova il watermark nella chat admin"),
+    BotCommand("preview_recap_now", "Forza il recap settimanale Preview"),
+    BotCommand("backup", "Ricevi un backup dello stato"),
+    BotCommand("help", "Mostra la guida completa"),
+)
+
 PUBLIC_URL_ENV_KEYS = (
     "PUBLIC_BASE_URL",
     "APP_URL",
@@ -452,6 +472,10 @@ def build_help_text() -> str:
         "/set_channel @canale - imposta il canale di destinazione\n"
         "/set_channel_here - da scrivere nel canale privato per impostarlo\n"
         "/set_preview_channel @canale - attiva Mouth Preview (solo immagini)\n"
+        "/preview_pin_default - aggiorna il pinned inglese\n"
+        "/preview_pin_custom TESTO - pubblica un pinned custom\n"
+        "/preview_test_watermark - invia un test nella chat admin\n"
+        "/preview_recap_now CONFIRM - pubblica ora il recap settimanale\n"
         "/channel_id - da scrivere nel canale privato per vedere il suo ID\n"
         "/dashboard - pannello con bottoni\n"
         "/set_interval 2h - imposta ogni quanto pubblicare\n"
@@ -542,13 +566,16 @@ async def web_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
-    await update.effective_message.reply_text(build_help_text())
+    await send_or_edit_dashboard(update, context)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
-    await update.effective_message.reply_text(build_help_text())
+    await update.effective_message.reply_text(
+        build_help_text(),
+        reply_markup=dashboard_keyboard(get_store(context), "help"),
+    )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -599,31 +626,118 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-def build_dashboard_text(store: Store) -> str:
+def build_dashboard_text(store: Store, view: str = "main") -> str:
     queued = store.queued_counts_by_type()
     coverage = get_queue_coverage(store, queued)
-    next_publish_at = get_or_initialize_next_publish_at(store)
     timezone_name = get_timezone_name(store)
+    next_publish_at = get_or_initialize_next_publish_at(store)
     paused = store.get_bool_setting("paused")
-    publish_backup = "spento"
-    if store.get_bool_setting("backup_after_publish_enabled", True):
-        publish_backup = "telegram" if store.get_bool_setting("backup_after_publish_send_telegram") else "locale"
+
+    if view == "settings":
+        return "\n".join(
+            [
+                "⚙️ Pubblicazione",
+                "",
+                f"Intervallo: {format_duration(store.get_int_setting('interval_minutes', 60))}",
+                f"Batch: {describe_batch_setting(store, queued)}",
+                f"Ordine: {store.get_setting('queue_order', 'random') or 'random'}",
+                f"Ratio foto/video: {store.get_int_setting('photo_ratio', 1)}:{store.get_int_setting('video_ratio', 1)}",
+                "",
+                "Scegli un preset qui sotto.",
+            ]
+        )
+    if view == "schedule":
+        return "\n".join(
+            [
+                "🗓 Programmazione",
+                "",
+                f"Prossimo post: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
+                f"Fasce: {format_posting_windows(get_posting_windows(store))}",
+                f"Timezone: {timezone_name}",
+                "",
+                "Le modifiche si applicano subito al prossimo ciclo.",
+            ]
+        )
+    if view == "backup":
+        publish_backup = "spento"
+        if store.get_bool_setting("backup_after_publish_enabled", True):
+            publish_backup = "telegram" if store.get_bool_setting("backup_after_publish_send_telegram") else "locale"
+        return "\n".join(
+            [
+                "💾 Backup",
+                "",
+                f"Automatico: {'attivo' if store.get_bool_setting('auto_backup_enabled') else 'spento'}",
+                f"Dopo ogni post: {publish_backup}",
+                "",
+                "Puoi creare subito una copia o cambiare la strategia.",
+            ]
+        )
+    if view == "preview":
+        preview_channel = store.get_setting("preview_channel_id", "non configurato") or "non configurato"
+        watermark = store.get_bool_setting("preview_watermark_enabled", True)
+        welcome_mode = store.get_setting("preview_welcome_mode", "default") or "default"
+        return "\n".join(
+            [
+                "🍓 Mouth Preview",
+                "",
+                f"Canale: {preview_channel}",
+                "Feed: 2 immagini al giorno · ritardo 48h",
+                "Notifiche: prima normale · seconda silenziosa",
+                f"Watermark: {'attivo' if watermark else 'spento'} · {store.get_setting('preview_watermark_text', '@MouthPreview')}",
+                f"Pinned: {'custom' if welcome_mode == 'custom' else 'default inglese'}",
+                "Upgrade card: ogni 6 immagini",
+                f"Recap: giorno {store.get_int_setting('preview_recap_weekday', 6)} alle {store.get_setting('preview_recap_time', '21:00')}",
+                "",
+                "I test non toccano coda o calendario; il recap è una pubblicazione reale e richiede conferma.",
+            ]
+        )
+    if view == "queue":
+        items = store.list_queued(limit=8)
+        lines = ["📦 Coda", "", f"Totale: {queued[PHOTO]} foto · {queued[VIDEO]} video"]
+        if not items:
+            lines.extend(["", "La coda è vuota."])
+        else:
+            lines.append("")
+            lines.extend(f"#{item.id} · {item.media_type} · {item.added_at}" for item in items)
+        return "\n".join(lines)
+    if view == "status":
+        return "\n".join(
+            [
+                "🩺 Stato sistema",
+                "",
+                f"Publisher: {'in pausa' if paused else 'attivo'}",
+                f"Canale Premium: {store.get_setting('channel_id', 'non impostato')}",
+                f"Coda: {queued[PHOTO]} foto · {queued[VIDEO]} video",
+                f"Copertura 24h: {format_coverage_status(coverage)}",
+                f"Prossimo: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
+                f"Falliti: {store.failed_count()}",
+            ]
+        )
+    if view == "help":
+        return (
+            "❓ Guida rapida\n\n"
+            "• Invia foto o video in questa chat per aggiungerli alla coda.\n"
+            "• Usa Pubblicazione e Programmazione per il feed Premium.\n"
+            "• Mouth Preview raccoglie branding, pinned e test.\n"
+            "• Backup contiene le opzioni di sicurezza.\n\n"
+            "I comandi avanzati restano disponibili da /help e dal menu Telegram."
+        )
+    if view == "preview_recap_confirm":
+        return (
+            "🧩 Pubblicare il recap ora?\n\n"
+            "Verrà creato con 9–12 foto Premium recenti e conteggi reali del database, "
+            "poi pubblicato silenziosamente su Mouth Preview.\n\n"
+            "Questa azione sostituisce il recap automatico della settimana corrente."
+        )
     return "\n".join(
         [
-            "Queue Bot Dashboard",
+            "🍓 Queue Bot",
             "",
-            f"Stato: {'in pausa' if paused else 'attivo'}",
-            f"Coda: {queued[PHOTO]} foto, {queued[VIDEO]} video",
+            f"{'⏸ In pausa' if paused else '✅ Attivo'} · {queued[PHOTO]} foto · {queued[VIDEO]} video",
             f"Prossimo: {format_next_publish_status(next_publish_at, timezone_name=timezone_name)}",
-            f"Intervallo: {format_duration(store.get_int_setting('interval_minutes', 60))}",
-            f"Fasce: {format_posting_windows(get_posting_windows(store))}",
-            f"Timezone: {timezone_name}",
-            f"Batch: {describe_batch_setting(store, queued)}",
-            f"Ordine: {store.get_setting('queue_order', 'random') or 'random'}",
-            f"Ratio: {store.get_int_setting('photo_ratio', 1)}:{store.get_int_setting('video_ratio', 1)}",
-            f"Copertura 24h: {format_coverage_status(coverage)}",
-            f"Auto-backup: {'attivo' if store.get_bool_setting('auto_backup_enabled') else 'spento'}",
-            f"Backup dopo post: {publish_backup}",
+            f"Copertura: {format_coverage_status(coverage)}",
+            "",
+            "Scegli un'area per continuare.",
         ]
     )
 
@@ -700,22 +814,60 @@ def dashboard_keyboard(store: Store, view: str = "main") -> InlineKeyboardMarkup
                 [InlineKeyboardButton("Dopo post: off", callback_data="dash:publishbackup:off")],
             ]
         )
+    if view == "preview":
+        watermark_enabled = store.get_bool_setting("preview_watermark_enabled", True)
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🏷 Spegni watermark" if watermark_enabled else "🏷 Attiva watermark",
+                        callback_data="dash:preview:watermark",
+                    )
+                ],
+                [
+                    InlineKeyboardButton("📌 Pinned default", callback_data="dash:preview:welcome-default"),
+                    InlineKeyboardButton("✏️ Pinned custom", callback_data="dash:preview:welcome-custom"),
+                ],
+                [
+                    InlineKeyboardButton("🧪 Test watermark", callback_data="dash:preview:test-watermark"),
+                    InlineKeyboardButton("🧩 Recap ora", callback_data="dash:preview:recap-confirm"),
+                ],
+                [InlineKeyboardButton("← Home", callback_data="dash:main")],
+            ]
+        )
+    if view == "preview_recap_confirm":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Pubblica recap", callback_data="dash:preview:recap-send")],
+                [InlineKeyboardButton("Annulla", callback_data="dash:view:preview")],
+            ]
+        )
+    if view in {"queue", "status", "help"}:
+        rows = [[InlineKeyboardButton("← Home", callback_data="dash:main")]]
+        if view != "help":
+            rows.insert(0, [InlineKeyboardButton("🔄 Aggiorna", callback_data=f"dash:view:{view}")])
+        return InlineKeyboardMarkup(rows)
+
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Pausa" if not paused else "Riprendi", callback_data="dash:pause" if not paused else "dash:resume"),
-                InlineKeyboardButton("Posta 1 ora", callback_data="dash:post1"),
-                InlineKeyboardButton("Aggiorna", callback_data="dash:main"),
+                InlineKeyboardButton("⏸ Pausa" if not paused else "▶️ Riprendi", callback_data="dash:pause" if not paused else "dash:resume"),
+                InlineKeyboardButton("🚀 Posta ora", callback_data="dash:post1"),
+                InlineKeyboardButton("🔄", callback_data="dash:main"),
             ],
             [
-                InlineKeyboardButton("Impostazioni", callback_data="dash:view:settings"),
-                InlineKeyboardButton("Orari", callback_data="dash:view:schedule"),
-                InlineKeyboardButton("Backup", callback_data="dash:view:backup"),
+                InlineKeyboardButton("📦 Coda", callback_data="dash:view:queue"),
+                InlineKeyboardButton("🗓 Programmazione", callback_data="dash:view:schedule"),
             ],
             [
-                InlineKeyboardButton("Coda", callback_data="dash:queue"),
-                InlineKeyboardButton("Status", callback_data="dash:status"),
+                InlineKeyboardButton("⚙️ Pubblicazione", callback_data="dash:view:settings"),
+                InlineKeyboardButton("🍓 Mouth Preview", callback_data="dash:view:preview"),
             ],
+            [
+                InlineKeyboardButton("💾 Backup", callback_data="dash:view:backup"),
+                InlineKeyboardButton("🩺 Stato", callback_data="dash:view:status"),
+            ],
+            [InlineKeyboardButton("❓ Guida", callback_data="dash:view:help")],
         ]
     )
 
@@ -727,7 +879,7 @@ async def send_or_edit_dashboard(
     note: str | None = None,
 ) -> None:
     store = get_store(context)
-    text = build_dashboard_text(store)
+    text = build_dashboard_text(store, view=view)
     if note:
         text = f"{note}\n\n{text}"
     markup = dashboard_keyboard(store, view)
@@ -757,6 +909,8 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     store = get_store(context)
     data = query.data
+    if data != "dash:preview:welcome-custom":
+        context.user_data.pop(PREVIEW_CUSTOM_WELCOME_ACTION, None)
     note: str | None = None
     view = "main"
 
@@ -788,6 +942,49 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "dash:status":
         await status_command(update, context)
         return
+    elif data == "dash:preview:watermark":
+        enabled = not store.get_bool_setting("preview_watermark_enabled", True)
+        store.set_setting("preview_watermark_enabled", "true" if enabled else "false")
+        note = f"Watermark {'attivato' if enabled else 'spento'}."
+        view = "preview"
+    elif data == "dash:preview:welcome-default":
+        try:
+            await update_preview_welcome(context.application, store, mode="default")
+            note = "Pinned inglese aggiornato nel canale Preview."
+        except (TelegramError, ValueError) as exc:
+            note = f"Aggiornamento pinned non riuscito: {exc}"
+        view = "preview"
+    elif data == "dash:preview:welcome-custom":
+        context.user_data[PREVIEW_CUSTOM_WELCOME_ACTION] = True
+        note = (
+            "Invia ora il testo personalizzato in questa chat. Sarà pubblicato come testo semplice "
+            "con il pulsante MemberPass. Tocca un altro bottone per annullare."
+        )
+        view = "preview"
+    elif data == "dash:preview:test-watermark":
+        try:
+            await send_preview_watermark_test(context.application, store, query.message.chat_id)
+            note = "Test watermark inviato qui in chat; coda e conteggi invariati."
+        except (TelegramError, OSError, ValueError) as exc:
+            note = f"Test watermark non riuscito: {exc}"
+        view = "preview"
+    elif data == "dash:preview:recap-confirm":
+        view = "preview_recap_confirm"
+    elif data == "dash:preview:recap-send":
+        try:
+            message, event = await WeeklyPreviewRecap(store).force_send(context.application)
+            if message is None and event is not None:
+                note = "Il recap della settimana corrente era già stato pubblicato."
+            elif message is None:
+                note = "Non è stato possibile creare il recap."
+            else:
+                note = (
+                    f"Recap pubblicato: {event.premium_count} contenuti Premium, "
+                    f"{event.preview_count} immagini Preview."
+                )
+        except (TelegramError, OSError, ValueError) as exc:
+            note = f"Recap non riuscito: {exc}"
+        view = "preview"
     elif data.startswith("dash:view:"):
         view = data.rsplit(":", 1)[-1]
     elif data.startswith("dash:int:"):
@@ -944,6 +1141,153 @@ async def set_preview_channel_command(update: Update, context: ContextTypes.DEFA
     await update.effective_message.reply_text(
         f"Mouth Preview attivato su {chat.title or channel_id}: 2 immagini al giorno, "
         "ritardo 48 ore, prima notifica normale e seconda silenziosa. I video restano solo Premium."
+    )
+
+
+async def update_preview_welcome(
+    application,
+    store: Store,
+    *,
+    mode: str,
+    custom_text: str = "",
+):
+    if not store.get_setting("preview_channel_id"):
+        raise ValueError("Configura prima Mouth Preview con /set_preview_channel.")
+    if mode not in {"default", "custom"}:
+        raise ValueError("Modalità pinned non valida.")
+    custom_text = custom_text.strip()
+    if mode == "custom" and not custom_text:
+        raise ValueError("Il testo custom non può essere vuoto.")
+    if len(custom_text) > 3500:
+        raise ValueError("Il testo custom deve restare sotto 3500 caratteri.")
+
+    previous_mode = store.get_setting("preview_welcome_mode", "default") or "default"
+    previous_text = store.get_setting("preview_welcome_custom_text", "") or ""
+    set_preview_welcome(store, mode, custom_text)
+    try:
+        return await ensure_preview_welcome(application, store, force=True)
+    except Exception:
+        set_preview_welcome(store, previous_mode, previous_text)
+        raise
+
+
+async def send_preview_watermark_test(application, store: Store, chat_id: int) -> None:
+    items = store.list_published_photos(limit=1)
+    if not items:
+        raise ValueError("Non ci sono foto Premium già pubblicate da usare per il test.")
+    photo = await prepare_preview_photo(
+        application,
+        store,
+        items[0],
+        force_watermark=True,
+    )
+    await application.bot.send_photo(
+        chat_id=chat_id,
+        photo=photo,
+        disable_notification=True,
+    )
+
+
+async def preview_pin_default_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    try:
+        await update_preview_welcome(context.application, get_store(context), mode="default")
+    except (TelegramError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Pinned non aggiornato: {exc}")
+        return
+    await update.effective_message.reply_text(
+        "Pinned Mouth Preview aggiornato con la versione inglese predefinita.",
+        reply_markup=dashboard_keyboard(get_store(context), "preview"),
+    )
+
+
+async def preview_pin_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    custom_text = " ".join(context.args).strip()
+    if not custom_text:
+        context.user_data[PREVIEW_CUSTOM_WELCOME_ACTION] = True
+        await update.effective_message.reply_text(
+            "Invia ora il testo custom in questa chat. Verrà pubblicato come testo semplice "
+            "con il pulsante MemberPass. Usa /dashboard per annullare.",
+            reply_markup=dashboard_keyboard(get_store(context), "preview"),
+        )
+        return
+    try:
+        await update_preview_welcome(
+            context.application,
+            get_store(context),
+            mode="custom",
+            custom_text=custom_text,
+        )
+    except (TelegramError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Pinned non aggiornato: {exc}")
+        return
+    await update.effective_message.reply_text("Pinned Mouth Preview custom aggiornato.")
+
+
+async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.pop(PREVIEW_CUSTOM_WELCOME_ACTION, False):
+        return
+    if not await ensure_admin(update, context):
+        return
+    text = (update.effective_message.text or "").strip()
+    try:
+        await update_preview_welcome(
+            context.application,
+            get_store(context),
+            mode="custom",
+            custom_text=text,
+        )
+    except (TelegramError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Pinned non aggiornato: {exc}")
+        return
+    await send_or_edit_dashboard(
+        update,
+        context,
+        view="preview",
+        note="Pinned Mouth Preview custom aggiornato.",
+    )
+
+
+async def preview_test_watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    try:
+        await send_preview_watermark_test(
+            context.application,
+            get_store(context),
+            update.effective_message.chat_id,
+        )
+    except (TelegramError, OSError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Test watermark non riuscito: {exc}")
+        return
+    await update.effective_message.reply_text(
+        "Test completato nella chat admin. Coda, conteggi e calendario non sono cambiati."
+    )
+
+
+async def preview_recap_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update, context):
+        return
+    if not context.args or context.args[0].upper() != "CONFIRM":
+        await update.effective_message.reply_text(
+            build_dashboard_text(get_store(context), "preview_recap_confirm"),
+            reply_markup=dashboard_keyboard(get_store(context), "preview_recap_confirm"),
+        )
+        return
+    try:
+        message, event = await WeeklyPreviewRecap(get_store(context)).force_send(context.application)
+    except (TelegramError, OSError, ValueError) as exc:
+        await update.effective_message.reply_text(f"Recap non riuscito: {exc}")
+        return
+    if message is None:
+        await update.effective_message.reply_text("Il recap della settimana corrente era già pubblicato.")
+        return
+    await update.effective_message.reply_text(
+        f"Recap pubblicato: {event.premium_count} contenuti Premium, "
+        f"{event.preview_count} immagini Preview."
     )
 
 
@@ -1889,13 +2233,20 @@ def schedule_auto_backup(application: Application, store: Store) -> None:
     LOGGER.info("Auto-backup scheduled in %s seconds", delay)
 
 
+async def configure_bot_commands(application: Application) -> None:
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+    except TelegramError:
+        LOGGER.warning("Could not update Telegram command menu", exc_info=True)
+
+
 def build_application(config: AppConfig) -> Application:
     auto_restore_state(config)
     store = Store(config.database_path)
     store.initialize()
     store.bootstrap(config)
 
-    application = ApplicationBuilder().token(config.bot_token).build()
+    application = ApplicationBuilder().token(config.bot_token).post_init(configure_bot_commands).build()
     application.bot_data["store"] = store
 
     application.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^dash:"))
@@ -1909,6 +2260,10 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("set_channel", set_channel_command))
     application.add_handler(CommandHandler("set_preview_channel", set_preview_channel_command))
     application.add_handler(CommandHandler("set_interval", set_interval_command))
+    application.add_handler(CommandHandler("preview_pin_default", preview_pin_default_command))
+    application.add_handler(CommandHandler("preview_pin_custom", preview_pin_custom_command))
+    application.add_handler(CommandHandler("preview_test_watermark", preview_test_watermark_command))
+    application.add_handler(CommandHandler("preview_recap_now", preview_recap_now_command))
     application.add_handler(CommandHandler("set_next", set_next_command))
     application.add_handler(CommandHandler("set_timezone", set_timezone_command))
     application.add_handler(CommandHandler("set_posting_hours", set_posting_hours_command))
@@ -1929,6 +2284,12 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("restore", restore_help_command))
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, handle_channel_text))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_admin_text_input,
+        )
+    )
 
     schedule_publisher(application, store)
     schedule_auto_backup(application, store)

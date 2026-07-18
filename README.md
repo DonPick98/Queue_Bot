@@ -211,6 +211,7 @@ Mouth Preview e un flusso separato dal canale Premium:
 - usa foto gia pubblicate in Premium da almeno 48 ore;
 - evita di ripetere la stessa sorgente nello stesso giorno;
 - invia la prima foto con notifica normale e la seconda silenziosa;
+- pubblica le foto senza caption e applica un watermark semitrasparente in basso a sinistra;
 - mantiene silenziosi welcome, upgrade card e recap settimanale;
 - crea una upgrade card ogni 6 anteprime e un mosaic settimanale con conteggi reali.
 
@@ -223,6 +224,9 @@ PREVIEW_POSTS_PER_DAY=2
 PREVIEW_POSTING_TIMES=10:00,20:00
 PREVIEW_MEMBERPASS_URL=https://my.memberpass.net/306354e7c4
 PREVIEW_MEMBERPASS_LINK_VERSION=v1
+PREVIEW_WATERMARK_ENABLED=true
+PREVIEW_WATERMARK_TEXT=@MouthPreview
+PREVIEW_WATERMARK_OPACITY=82
 PREVIEW_RECAP_WEEKDAY=6
 PREVIEW_RECAP_TIME=21:00
 ```
