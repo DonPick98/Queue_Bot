@@ -53,6 +53,7 @@ class MediaItem:
     derived_tags: tuple[str, ...] = ()
     media_width: int | None = None
     media_height: int | None = None
+    channel_message_id: int | None = None
     preview_eligible_at: str | None = None
     preview_published_at: str | None = None
     preview_message_id: int | None = None
@@ -335,6 +336,7 @@ class Store:
             "preview_watermark_enabled": "true" if config.preview_watermark_enabled else "false",
             "preview_watermark_text": config.preview_watermark_text,
             "preview_watermark_opacity": str(config.preview_watermark_opacity),
+            "preview_watermark_scale_percent": str(config.preview_watermark_scale_percent),
             "preview_recap_weekday": str(config.preview_recap_weekday),
             "preview_recap_time": config.preview_recap_time,
             "preview_welcome_mode": "default",
@@ -353,6 +355,21 @@ class Store:
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                     (key, value),
+                )
+            watermark_style_version = connection.execute(
+                "SELECT value FROM settings WHERE key = 'preview_watermark_style_version'"
+            ).fetchone()
+            if watermark_style_version is None:
+                connection.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'preview_watermark_opacity'",
+                    (str(config.preview_watermark_opacity),),
+                )
+                connection.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'preview_watermark_scale_percent'",
+                    (str(config.preview_watermark_scale_percent),),
+                )
+                connection.execute(
+                    "INSERT INTO settings(key, value) VALUES('preview_watermark_style_version', 'v2')"
                 )
             if existing_schedule_mode is None:
                 connection.execute(
@@ -398,6 +415,13 @@ class Store:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (key, value),
+            )
+
+    def update_media_file_id(self, media_item_id: int, file_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET file_id = ? WHERE id = ?",
+                (file_id, media_item_id),
             )
 
     def get_int_setting(self, key: str, default: int) -> int:
@@ -1311,6 +1335,7 @@ class Store:
             derived_tags=parse_tags(row["derived_tags_json"] if "derived_tags_json" in row.keys() else None),
             media_width=optional_int(row, "media_width"),
             media_height=optional_int(row, "media_height"),
+            channel_message_id=optional_int(row, "channel_message_id"),
             preview_eligible_at=(row["preview_eligible_at"] if "preview_eligible_at" in row.keys() else None),
             preview_published_at=(row["preview_published_at"] if "preview_published_at" in row.keys() else None),
             preview_message_id=optional_int(row, "preview_message_id"),

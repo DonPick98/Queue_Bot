@@ -177,7 +177,8 @@ def _watermark_font(size: int):
 def build_watermarked_photo(
     content: bytes,
     text: str = "@MouthPreview",
-    opacity: int = 82,
+    opacity: int = 64,
+    scale_percent: int = 10,
     max_dimension: int = PREVIEW_WATERMARK_MAX_DIMENSION,
 ) -> BytesIO:
     max_dimension = max(720, int(max_dimension))
@@ -193,7 +194,8 @@ def build_watermarked_photo(
         image = image.convert("RGBA")
 
     width, height = image.size
-    font_size = max(18, min(52, round(min(width, height) * 0.034)))
+    scale_percent = max(3, min(18, int(scale_percent)))
+    font_size = max(8, round(min(width, height) * scale_percent / 100))
     padding = max(8, round(min(width, height) * 0.025))
     font = _watermark_font(font_size)
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
@@ -224,21 +226,72 @@ def build_watermarked_photo(
     return output
 
 
+async def _download_preview_source(
+    application,
+    store: Store,
+    item: MediaItem,
+    staging_chat_id: int | str | None = None,
+) -> tuple[bytes, str]:
+    file_id = item.file_id
+    forwarded_message = None
+    try:
+        telegram_file = await application.bot.get_file(file_id)
+        content = bytes(await telegram_file.download_as_bytearray())
+    except TelegramError:
+        if not item.channel_message_id:
+            raise
+        if staging_chat_id is None:
+            admin_ids = sorted(store.get_admin_ids())
+            staging_chat_id = admin_ids[0] if admin_ids else None
+        premium_channel_id = store.get_setting("channel_id")
+        if staging_chat_id is None or not premium_channel_id:
+            raise
+        forwarded_message = await application.bot.forward_message(
+            chat_id=staging_chat_id,
+            from_chat_id=premium_channel_id,
+            message_id=item.channel_message_id,
+            disable_notification=True,
+        )
+        try:
+            if not forwarded_message.photo:
+                raise ValueError("Il messaggio Premium recuperato non contiene una foto.")
+            file_id = forwarded_message.photo[-1].file_id
+            store.update_media_file_id(item.id, file_id)
+            telegram_file = await application.bot.get_file(file_id)
+            content = bytes(await telegram_file.download_as_bytearray())
+        finally:
+            try:
+                await application.bot.delete_message(
+                    chat_id=staging_chat_id,
+                    message_id=forwarded_message.message_id,
+                )
+            except TelegramError:
+                LOGGER.warning("Could not delete temporary Preview recovery message", exc_info=True)
+    return content, file_id
+
+
 async def prepare_preview_photo(
     application,
     store: Store,
     item: MediaItem,
     force_watermark: bool = False,
+    staging_chat_id: int | str | None = None,
 ):
+    content, file_id = await _download_preview_source(
+        application,
+        store,
+        item,
+        staging_chat_id=staging_chat_id,
+    )
+
     if not force_watermark and not store.get_bool_setting("preview_watermark_enabled", True):
-        return item.file_id
-    telegram_file = await application.bot.get_file(item.file_id)
-    content = bytes(await telegram_file.download_as_bytearray())
+        return file_id
     return await asyncio.to_thread(
         build_watermarked_photo,
         content,
         store.get_setting("preview_watermark_text", "@MouthPreview") or "@MouthPreview",
-        store.get_int_setting("preview_watermark_opacity", 82),
+        store.get_int_setting("preview_watermark_opacity", 64),
+        store.get_int_setting("preview_watermark_scale_percent", 10),
     )
 
 
@@ -322,6 +375,48 @@ class PreviewPublisher:
             )
             PreviewConversionScheduler(self.store).ensure_upgrade_event(published_at)
         return sent_count
+
+    async def publish_one_now(
+        self,
+        application,
+        now: datetime | None = None,
+        staging_chat_id: int | str | None = None,
+    ) -> MediaItem | None:
+        channel_id = self.store.get_setting("preview_channel_id")
+        if not channel_id:
+            raise ValueError("Configura prima il canale Mouth Preview.")
+        now = now or utcnow()
+        timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
+        start, end, local_date = local_day_bounds(now, timezone_name)
+        history = self.store.preview_history_between(start.isoformat(), end.isoformat())
+        item = self.selector.choose(
+            self.store.list_preview_candidates(now.isoformat()),
+            history,
+            self.store.latest_preview_item(),
+        )
+        if item is None:
+            return None
+        policy = self.store.get_or_assign_preview_notification_policy(item.id, local_date)
+        try:
+            photo = await prepare_preview_photo(
+                application,
+                self.store,
+                item,
+                staging_chat_id=staging_chat_id,
+            )
+            sent = await application.bot.send_photo(
+                chat_id=channel_id,
+                photo=photo,
+                disable_notification=policy.silent,
+            )
+        except (TelegramError, OSError, ValueError) as exc:
+            self.store.mark_preview_failed(item.id, str(exc))
+            raise
+        published_at = utcnow().isoformat(timespec="seconds")
+        self.store.mark_preview_published(item.id, sent.message_id, published_at)
+        PreviewConversionScheduler(self.store).ensure_upgrade_event(published_at)
+        LOGGER.info("Manually published Mouth Preview photo %s", item.id)
+        return self.store.find_media_by_id(item.id) or item
 
 
 @dataclass
@@ -411,14 +506,55 @@ class WeeklyPreviewRecap:
             self.store.get_setting("preview_memberpass_link_version", "v1") or "v1",
         )
 
-    async def send_event(self, application, event: PreviewConversionEvent):
+    def build_test_event(self, now: datetime | None = None) -> PreviewConversionEvent:
+        now = now or utcnow()
+        timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
+        zone = ZoneInfo(timezone_name)
+        local = now.astimezone(zone)
+        week_start_local = datetime.combine(local.date() - timedelta(days=6), time.min, tzinfo=zone)
+        start_at = week_start_local.astimezone(UTC).isoformat()
+        end_at = now.isoformat()
+        return PreviewConversionEvent(
+            id=0,
+            kind="weekly_recap",
+            event_key=f"test:{now.isoformat()}",
+            status="test",
+            eligible_at=end_at,
+            start_at=start_at,
+            end_at=end_at,
+            premium_count=self.store.premium_count_between(start_at, end_at),
+            preview_count=self.store.preview_count_between(start_at, end_at),
+            media_item_ids=self.store.published_photo_ids_between(
+                start_at,
+                end_at,
+                PREVIEW_MOSAIC_LIMIT,
+            ),
+            memberpass_link_version=(
+                self.store.get_setting("preview_memberpass_link_version", "v1") or "v1"
+            ),
+            message_id=None,
+            attempts=0,
+            error=None,
+        )
+
+    async def send_event(
+        self,
+        application,
+        event: PreviewConversionEvent,
+        staging_chat_id: int | str | None = None,
+    ):
         contents: list[bytes] = []
         for media_id in event.media_item_ids:
             item = self.store.find_media_by_id(media_id)
             if item is None:
                 continue
-            telegram_file = await application.bot.get_file(item.file_id)
-            contents.append(bytes(await telegram_file.download_as_bytearray()))
+            content, _ = await _download_preview_source(
+                application,
+                self.store,
+                item,
+                staging_chat_id=staging_chat_id,
+            )
+            contents.append(content)
         mosaic = build_mosaic(contents)
         return await application.bot.send_photo(
             chat_id=self.store.get_setting("preview_channel_id"),
@@ -434,6 +570,17 @@ class WeeklyPreviewRecap:
             ),
             disable_notification=True,
         )
+
+    async def send_test(
+        self,
+        application,
+        now: datetime | None = None,
+        staging_chat_id: int | str | None = None,
+    ):
+        event = self.build_test_event(now)
+        message = await self.send_event(application, event, staging_chat_id=staging_chat_id)
+        LOGGER.info("Published Mouth Preview weekly recap test without creating a weekly event")
+        return message, event
 
     async def force_send(self, application, now: datetime | None = None):
         event = self.ensure_event(now=now, force=True)

@@ -15,6 +15,7 @@ from telegram_channel_scheduler_bot.preview import (
     PreviewSelector,
     WeeklyPreviewRecap,
     build_watermarked_photo,
+    prepare_preview_photo,
     preview_welcome_version,
     set_preview_welcome,
     build_mosaic,
@@ -74,6 +75,28 @@ class FakeWelcomeBot:
 
     async def delete_message(self, **kwargs):
         self.deletions.append(kwargs)
+
+
+class FakeRecoverBot(FakePreviewBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forwarded: list[dict[str, object]] = []
+        self.deleted: list[dict[str, object]] = []
+
+    async def get_file(self, file_id: str):
+        if file_id == "file-1":
+            raise TelegramError("Wrong file_id or the file is temporarily unavailable")
+        return await super().get_file(file_id)
+
+    async def forward_message(self, **kwargs):
+        self.forwarded.append(kwargs)
+        return SimpleNamespace(
+            message_id=811,
+            photo=[SimpleNamespace(file_id="fresh-file-1")],
+        )
+
+    async def delete_message(self, **kwargs):
+        self.deleted.append(kwargs)
 
 
 class PreviewTests(unittest.IsolatedAsyncioTestCase):
@@ -299,6 +322,65 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
                     self.assertLess(lower_left.getextrema()[0], 110)
                     self.assertGreater(lower_left.getextrema()[1], 145)
                     self.assertAlmostEqual(grayscale.getpixel((width - 20, 20)), 125, delta=8)
+
+    def test_watermark_scale_is_relative_to_image_resolution(self):
+        heights: list[int] = []
+        for size in ((800, 1200), (1600, 2400)):
+            source = BytesIO()
+            Image.new("RGB", size, (125, 125, 125)).save(source, format="PNG")
+            output = build_watermarked_photo(
+                source.getvalue(),
+                opacity=128,
+                scale_percent=10,
+                max_dimension=3000,
+            )
+            with Image.open(output) as rendered:
+                grayscale = rendered.convert("L")
+                mask = grayscale.point(lambda value: 255 if value < 105 or value > 145 else 0)
+                bounds = mask.getbbox()
+                self.assertIsNotNone(bounds)
+                heights.append(bounds[3] - bounds[1])
+        self.assertGreater(heights[1] / heights[0], 1.8)
+        self.assertLess(heights[1] / heights[0], 2.2)
+
+    async def test_invalid_file_id_is_recovered_from_original_premium_message(self):
+        store = self.make_store()
+        store.set_setting("channel_id", "@premium")
+        item = self.add_published(store, 1)
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET channel_message_id = 501 WHERE id = ?",
+                (item.id,),
+            )
+        bot = FakeRecoverBot()
+
+        rendered = await prepare_preview_photo(
+            SimpleNamespace(bot=bot),
+            store,
+            store.find_media_by_id(item.id),
+            force_watermark=True,
+            staging_chat_id=99,
+        )
+
+        self.assertIsInstance(rendered, BytesIO)
+        self.assertEqual(store.find_media_by_id(item.id).file_id, "fresh-file-1")
+        self.assertEqual(bot.forwarded[0]["message_id"], 501)
+        self.assertEqual(bot.deleted[0]["message_id"], 811)
+
+    async def test_manual_preview_button_path_publishes_one_eligible_photo(self):
+        store = self.make_store()
+        item = self.add_published(store, 1)
+        bot = FakePreviewBot()
+
+        published = await PreviewPublisher(store).publish_one_now(
+            SimpleNamespace(bot=bot),
+            datetime(2026, 7, 13, 9, 0, tzinfo=UTC),
+            staging_chat_id=99,
+        )
+
+        self.assertEqual(published.id, item.id)
+        self.assertEqual(len(bot.photos), 1)
+        self.assertIsNotNone(store.find_media_by_id(item.id).preview_published_at)
     async def test_custom_welcome_is_plain_text_with_memberpass_button(self):
         store = self.make_store()
         set_preview_welcome(store, "custom", "Custom <b>plain</b> welcome")
@@ -334,6 +416,22 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(repeated_message)
         self.assertEqual(repeated_event.event_key, event.event_key)
         self.assertEqual(len(bot.photos), 1)
+
+    async def test_recap_test_does_not_consume_the_weekly_event(self):
+        store = self.make_store()
+        item = self.add_published(store, 1)
+        now = datetime.now(UTC)
+        store.mark_preview_published(item.id, 3001, now.isoformat(timespec="seconds"))
+        bot = FakePreviewBot()
+        recap = WeeklyPreviewRecap(store)
+
+        _, test_event = await recap.send_test(SimpleNamespace(bot=bot), now=now)
+
+        self.assertEqual(test_event.status, "test")
+        self.assertEqual(store.pending_preview_conversion_events(now.isoformat()), [])
+        weekly_event = recap.ensure_event(now=now, force=True)
+        self.assertEqual(weekly_event.status, "pending")
+        self.assertTrue(weekly_event.event_key.startswith("weekly:"))
 
 
 if __name__ == "__main__":

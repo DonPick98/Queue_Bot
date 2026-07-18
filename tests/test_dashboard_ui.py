@@ -66,8 +66,14 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("dash:preview:welcome-default", callbacks)
         self.assertIn("dash:preview:welcome-custom", callbacks)
         self.assertIn("dash:preview:test-watermark", callbacks)
+        self.assertIn("dash:preview:photo-confirm", callbacks)
         self.assertIn("dash:preview:recap-confirm", callbacks)
+        self.assertIn("dash:preview:size-down", callbacks)
+        self.assertIn("dash:preview:size-up", callbacks)
+        self.assertIn("dash:preview:opacity-down", callbacks)
+        self.assertIn("dash:preview:opacity-up", callbacks)
         self.assertIn("Watermark: attivo", build_dashboard_text(store, "preview"))
+        self.assertIn("Dimensione: 10%", build_dashboard_text(store, "preview"))
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
 
     def test_telegram_command_menu_contains_preview_tools(self):

@@ -41,6 +41,7 @@ from .posting_plan import (
     seconds_until_next_publish,
 )
 from .preview import (
+    PreviewPublisher,
     WeeklyPreviewRecap,
     ensure_preview_welcome,
     prepare_preview_photo,
@@ -85,7 +86,7 @@ BOT_COMMANDS = (
     BotCommand("preview_pin_default", "Ripristina il pinned Preview inglese"),
     BotCommand("preview_pin_custom", "Imposta un pinned Preview personalizzato"),
     BotCommand("preview_test_watermark", "Prova il watermark nella chat admin"),
-    BotCommand("preview_recap_now", "Forza il recap settimanale Preview"),
+    BotCommand("preview_recap_now", "Prova il recap senza cambiare il settimanale"),
     BotCommand("backup", "Ricevi un backup dello stato"),
     BotCommand("help", "Mostra la guida completa"),
 )
@@ -475,7 +476,7 @@ def build_help_text() -> str:
         "/preview_pin_default - aggiorna il pinned inglese\n"
         "/preview_pin_custom TESTO - pubblica un pinned custom\n"
         "/preview_test_watermark - invia un test nella chat admin\n"
-        "/preview_recap_now CONFIRM - pubblica ora il recap settimanale\n"
+        "/preview_recap_now CONFIRM - invia un recap di test senza consumare il settimanale\n"
         "/channel_id - da scrivere nel canale privato per vedere il suo ID\n"
         "/dashboard - pannello con bottoni\n"
         "/set_interval 2h - imposta ogni quanto pubblicare\n"
@@ -684,11 +685,13 @@ def build_dashboard_text(store: Store, view: str = "main") -> str:
                 "Feed: 2 immagini al giorno · ritardo 48h",
                 "Notifiche: prima normale · seconda silenziosa",
                 f"Watermark: {'attivo' if watermark else 'spento'} · {store.get_setting('preview_watermark_text', '@MouthPreview')}",
+                f"Dimensione: {store.get_int_setting('preview_watermark_scale_percent', 10)}% del lato corto",
+                f"Opacità: {round(store.get_int_setting('preview_watermark_opacity', 64) / 255 * 100)}%",
                 f"Pinned: {'custom' if welcome_mode == 'custom' else 'default inglese'}",
                 "Upgrade card: ogni 6 immagini",
                 f"Recap: giorno {store.get_int_setting('preview_recap_weekday', 6)} alle {store.get_setting('preview_recap_time', '21:00')}",
                 "",
-                "I test non toccano coda o calendario; il recap è una pubblicazione reale e richiede conferma.",
+                "I test non toccano coda o calendario; la foto manuale è una pubblicazione reale.",
             ]
         )
     if view == "queue":
@@ -724,10 +727,16 @@ def build_dashboard_text(store: Store, view: str = "main") -> str:
         )
     if view == "preview_recap_confirm":
         return (
-            "🧩 Pubblicare il recap ora?\n\n"
+            "🧩 Inviare un recap di test ora?\n\n"
             "Verrà creato con 9–12 foto Premium recenti e conteggi reali del database, "
             "poi pubblicato silenziosamente su Mouth Preview.\n\n"
-            "Questa azione sostituisce il recap automatico della settimana corrente."
+            "Il recap automatico della settimana resta programmato e potrà essere inviato normalmente."
+        )
+    if view == "preview_photo_confirm":
+        return (
+            "🖼 Pubblicare una foto ora?\n\n"
+            "Il bot sceglierà una foto Premium idonea (almeno 48 ore), applicherà il watermark "
+            "e la pubblicherà realmente su Mouth Preview. Verrà conteggiata tra le foto di oggi."
         )
     return "\n".join(
         [
@@ -825,20 +834,36 @@ def dashboard_keyboard(store: Store, view: str = "main") -> InlineKeyboardMarkup
                     )
                 ],
                 [
+                    InlineKeyboardButton("🔎 Dimensione −", callback_data="dash:preview:size-down"),
+                    InlineKeyboardButton("🔍 Dimensione +", callback_data="dash:preview:size-up"),
+                ],
+                [
+                    InlineKeyboardButton("🌫 Più trasparente", callback_data="dash:preview:opacity-down"),
+                    InlineKeyboardButton("☀️ Più visibile", callback_data="dash:preview:opacity-up"),
+                ],
+                [
                     InlineKeyboardButton("📌 Pinned default", callback_data="dash:preview:welcome-default"),
                     InlineKeyboardButton("✏️ Pinned custom", callback_data="dash:preview:welcome-custom"),
                 ],
                 [
                     InlineKeyboardButton("🧪 Test watermark", callback_data="dash:preview:test-watermark"),
-                    InlineKeyboardButton("🧩 Recap ora", callback_data="dash:preview:recap-confirm"),
+                    InlineKeyboardButton("🖼 Pubblica foto", callback_data="dash:preview:photo-confirm"),
                 ],
+                [InlineKeyboardButton("🧩 Test recap", callback_data="dash:preview:recap-confirm")],
                 [InlineKeyboardButton("← Home", callback_data="dash:main")],
             ]
         )
     if view == "preview_recap_confirm":
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("✅ Pubblica recap", callback_data="dash:preview:recap-send")],
+                [InlineKeyboardButton("✅ Invia test recap", callback_data="dash:preview:recap-send")],
+                [InlineKeyboardButton("Annulla", callback_data="dash:view:preview")],
+            ]
+        )
+    if view == "preview_photo_confirm":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Pubblica foto", callback_data="dash:preview:photo-send")],
                 [InlineKeyboardButton("Annulla", callback_data="dash:view:preview")],
             ]
         )
@@ -947,6 +972,18 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         store.set_setting("preview_watermark_enabled", "true" if enabled else "false")
         note = f"Watermark {'attivato' if enabled else 'spento'}."
         view = "preview"
+    elif data in {"dash:preview:size-down", "dash:preview:size-up"}:
+        current = store.get_int_setting("preview_watermark_scale_percent", 10)
+        updated = max(3, min(18, current + (-1 if data.endswith("down") else 1)))
+        store.set_setting("preview_watermark_scale_percent", str(updated))
+        note = f"Dimensione watermark impostata al {updated}% del lato corto."
+        view = "preview"
+    elif data in {"dash:preview:opacity-down", "dash:preview:opacity-up"}:
+        current = store.get_int_setting("preview_watermark_opacity", 64)
+        updated = max(24, min(160, current + (-16 if data.endswith("down") else 16)))
+        store.set_setting("preview_watermark_opacity", str(updated))
+        note = f"Opacità watermark impostata al {round(updated / 255 * 100)}%."
+        view = "preview"
     elif data == "dash:preview:welcome-default":
         try:
             await update_preview_welcome(context.application, store, mode="default")
@@ -972,18 +1009,32 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         view = "preview_recap_confirm"
     elif data == "dash:preview:recap-send":
         try:
-            message, event = await WeeklyPreviewRecap(store).force_send(context.application)
-            if message is None and event is not None:
-                note = "Il recap della settimana corrente era già stato pubblicato."
-            elif message is None:
-                note = "Non è stato possibile creare il recap."
-            else:
-                note = (
-                    f"Recap pubblicato: {event.premium_count} contenuti Premium, "
-                    f"{event.preview_count} immagini Preview."
-                )
+            _, event = await WeeklyPreviewRecap(store).send_test(
+                context.application,
+                staging_chat_id=query.message.chat_id,
+            )
+            note = (
+                f"Test recap pubblicato: {event.premium_count} contenuti Premium, "
+                f"{event.preview_count} immagini Preview. Il settimanale resta intatto."
+            )
         except (TelegramError, OSError, ValueError) as exc:
             note = f"Recap non riuscito: {exc}"
+        view = "preview"
+    elif data == "dash:preview:photo-confirm":
+        view = "preview_photo_confirm"
+    elif data == "dash:preview:photo-send":
+        try:
+            item = await PreviewPublisher(store).publish_one_now(
+                context.application,
+                staging_chat_id=query.message.chat_id,
+            )
+            note = (
+                f"Foto #{item.id} pubblicata su Mouth Preview."
+                if item is not None
+                else "Non ci sono foto idonee e diverse da pubblicare ora."
+            )
+        except (TelegramError, OSError, ValueError) as exc:
+            note = f"Pubblicazione Preview non riuscita: {exc}"
         view = "preview"
     elif data.startswith("dash:view:"):
         view = data.rsplit(":", 1)[-1]
@@ -1172,20 +1223,29 @@ async def update_preview_welcome(
 
 
 async def send_preview_watermark_test(application, store: Store, chat_id: int) -> None:
-    items = store.list_published_photos(limit=1)
+    items = store.list_published_photos(limit=8)
     if not items:
         raise ValueError("Non ci sono foto Premium già pubblicate da usare per il test.")
-    photo = await prepare_preview_photo(
-        application,
-        store,
-        items[0],
-        force_watermark=True,
-    )
-    await application.bot.send_photo(
-        chat_id=chat_id,
-        photo=photo,
-        disable_notification=True,
-    )
+    last_error: Exception | None = None
+    for item in items:
+        try:
+            photo = await prepare_preview_photo(
+                application,
+                store,
+                item,
+                force_watermark=True,
+                staging_chat_id=chat_id,
+            )
+            await application.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                disable_notification=True,
+            )
+            return
+        except (TelegramError, OSError, ValueError) as exc:
+            last_error = exc
+            LOGGER.warning("Watermark test skipped unavailable photo %s", item.id, exc_info=True)
+    raise ValueError(f"Nessuna foto Premium recuperabile per il test: {last_error}")
 
 
 async def preview_pin_default_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1278,16 +1338,16 @@ async def preview_recap_now_command(update: Update, context: ContextTypes.DEFAUL
         )
         return
     try:
-        message, event = await WeeklyPreviewRecap(get_store(context)).force_send(context.application)
+        message, event = await WeeklyPreviewRecap(get_store(context)).send_test(
+            context.application,
+            staging_chat_id=update.effective_message.chat_id,
+        )
     except (TelegramError, OSError, ValueError) as exc:
         await update.effective_message.reply_text(f"Recap non riuscito: {exc}")
         return
-    if message is None:
-        await update.effective_message.reply_text("Il recap della settimana corrente era già pubblicato.")
-        return
     await update.effective_message.reply_text(
-        f"Recap pubblicato: {event.premium_count} contenuti Premium, "
-        f"{event.preview_count} immagini Preview."
+        f"Test recap pubblicato: {event.premium_count} contenuti Premium, "
+        f"{event.preview_count} immagini Preview. Il recap settimanale resta intatto."
     )
 
 
@@ -1990,6 +2050,9 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
             channel_message_id=sent_message.message_id,
             media_item_id=item.id,
         )
+        sent_photos = getattr(sent_message, "photo", None)
+        if item.media_type == PHOTO and sent_photos:
+            store.update_media_file_id(item.id, sent_photos[-1].file_id)
         store.set_setting("last_published_type", item.media_type)
         LOGGER.info(
             "Published paid-channel media item %s (%s), notification=%s%s",
