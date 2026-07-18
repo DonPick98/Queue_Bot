@@ -14,11 +14,17 @@ class FakeBot:
         self.photos: list[str] = []
         self.videos: list[str] = []
         self.sent_media: list[tuple[str, str]] = []
+        self.notification_attempts: list[tuple[str, bool | None]] = []
+        self.failures_remaining: dict[str, int] = {}
 
     async def send_photo(self, **kwargs):
         photo = kwargs["photo"]
         self.photos.append(photo)
         self.sent_media.append(("photo", photo))
+        self.notification_attempts.append((photo, kwargs.get("disable_notification")))
+        if self.failures_remaining.get(photo, 0) > 0:
+            self.failures_remaining[photo] -= 1
+            raise TelegramError("temporary send failure")
         if photo == "bad-file":
             raise TelegramError("file is unavailable")
         return SimpleNamespace(message_id=777)
@@ -27,6 +33,7 @@ class FakeBot:
         video = kwargs["video"]
         self.videos.append(video)
         self.sent_media.append(("video", video))
+        self.notification_attempts.append((video, kwargs.get("disable_notification")))
         return SimpleNamespace(message_id=888)
 
 
@@ -44,6 +51,12 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
         store.set_setting("photo_ratio", "1")
         store.set_setting("video_ratio", "1")
         store.set_setting("balance_window", "20")
+        store.set_setting("interval_minutes", "120")
+        store.set_setting("posts_per_run", "1")
+        store.set_setting("batch_mode", "fixed")
+        store.set_setting("timezone", "Europe/Rome")
+        store.set_setting("posting_windows", "all")
+        store.set_setting("audible_posts_per_day", "3")
         return store
 
     async def cleanup_database(self, database_path: Path) -> None:
@@ -145,6 +158,55 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
                 ("video", "video-1"),
             ],
         )
+
+    async def test_twelve_automated_posts_are_individual_with_three_even_notifications(self):
+        store = self.make_store()
+        for index in range(12):
+            store.add_media("photo", f"photo-{index + 1}", f"unique-{index + 1}", None, 123)
+        app = SimpleNamespace(bot=FakeBot(), bot_data={"store": store})
+
+        with self.assertLogs("telegram_channel_scheduler_bot.telegram_app", level="INFO") as logs:
+            outcomes = await publish_many(app, count=12, manual=False)
+
+        self.assertTrue(all(outcome.status == "published" for outcome in outcomes))
+        self.assertEqual(len(app.bot.photos), 12)
+        self.assertEqual(
+            [silent for _, silent in app.bot.notification_attempts],
+            [False, True, True, True, False, True, True, True, False, True, True, True],
+        )
+        self.assertEqual(sum("notification=normal" in entry for entry in logs.output), 3)
+        self.assertEqual(sum("notification=silent" in entry for entry in logs.output), 9)
+
+    async def test_notification_choice_is_preserved_when_send_retries(self):
+        store = self.make_store()
+        flaky = store.add_media("photo", "flaky-file", "flaky-unique", None, 123)
+        store.add_media("photo", "good-file", "good-unique", None, 123)
+        bot = FakeBot()
+        bot.failures_remaining["flaky-file"] = 1
+        app = SimpleNamespace(bot=bot, bot_data={"store": store})
+
+        first = await publish_next(app)
+        second = await publish_next(app)
+
+        self.assertEqual(first.status, "published")
+        self.assertEqual(second.status, "published")
+        self.assertEqual(
+            bot.notification_attempts,
+            [("flaky-file", False), ("good-file", True), ("flaky-file", False)],
+        )
+        retried = store.find_media_by_id(flaky.media_item.id)
+        self.assertFalse(retried.notification_silent)
+        self.assertEqual(retried.notification_position, 1)
+
+    async def test_manual_paid_channel_post_keeps_existing_notification_behaviour(self):
+        store = self.make_store()
+        store.add_media("video", "manual-video", "manual-unique", None, 123)
+        app = SimpleNamespace(bot=FakeBot(), bot_data={"store": store})
+
+        outcome = await publish_next(app, manual=True)
+
+        self.assertEqual(outcome.status, "published")
+        self.assertEqual(app.bot.notification_attempts, [("manual-video", None)])
 
 
 if __name__ == "__main__":

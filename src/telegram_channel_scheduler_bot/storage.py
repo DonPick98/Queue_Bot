@@ -10,6 +10,7 @@ from typing import Iterable, Iterator
 
 from .balancer import PHOTO, VIDEO
 from .config import AppConfig
+from .notifications import MAX_AUDIBLE_POSTS_PER_DAY, audible_post_positions
 
 
 QUEUED = "queued"
@@ -43,6 +44,17 @@ class MediaItem:
     video_width: int | None = None
     video_height: int | None = None
     video_duration: int | None = None
+    notification_silent: bool | None = None
+    notification_local_date: str | None = None
+    notification_position: int | None = None
+
+
+@dataclass(frozen=True)
+class NotificationPolicy:
+    silent: bool
+    local_date: str
+    position: int
+    planned_posts: int
 
 
 @dataclass(frozen=True)
@@ -102,7 +114,10 @@ class Store:
                     available_after_publish_count INTEGER NOT NULL DEFAULT 0,
                     video_width INTEGER,
                     video_height INTEGER,
-                    video_duration INTEGER
+                    video_duration INTEGER,
+                    notification_silent INTEGER CHECK (notification_silent IN (0, 1)),
+                    notification_local_date TEXT,
+                    notification_position INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS published_media (
@@ -126,6 +141,14 @@ class Store:
                     channel_message_id INTEGER
                 );
 
+                CREATE TABLE IF NOT EXISTS notification_day_plans (
+                    local_date TEXT PRIMARY KEY,
+                    planned_posts INTEGER NOT NULL,
+                    audible_limit INTEGER NOT NULL,
+                    next_position INTEGER NOT NULL DEFAULT 0,
+                    audible_reserved INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_media_items_status_type
                     ON media_items(status, media_type, added_at);
 
@@ -141,6 +164,9 @@ class Store:
             self._ensure_column(connection, "media_items", "video_width INTEGER")
             self._ensure_column(connection, "media_items", "video_height INTEGER")
             self._ensure_column(connection, "media_items", "video_duration INTEGER")
+            self._ensure_column(connection, "media_items", "notification_silent INTEGER")
+            self._ensure_column(connection, "media_items", "notification_local_date TEXT")
+            self._ensure_column(connection, "media_items", "notification_position INTEGER")
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
             self._ensure_column(connection, "published_media", "content_hash TEXT")
             self._ensure_column(connection, "published_media", "visual_hash TEXT")
@@ -210,6 +236,7 @@ class Store:
             "queue_alert_active": "false",
             "queue_order": config.default_queue_order,
             "timezone": config.default_timezone,
+            "audible_posts_per_day": str(config.default_audible_posts_per_day),
             "posting_windows": config.default_posting_windows,
             "schedule_mode": config.default_schedule_mode,
             "auto_backup_enabled": "true" if config.default_auto_backup_enabled else "false",
@@ -567,6 +594,84 @@ class Store:
                 (attempts, status, error[:1000], media_item_id),
             )
 
+    def get_or_assign_notification_policy(
+        self,
+        media_item_id: int,
+        local_date: str,
+        planned_posts: int,
+        audible_limit: int,
+    ) -> NotificationPolicy:
+        planned = max(1, int(planned_posts))
+        limit = min(MAX_AUDIBLE_POSTS_PER_DAY, max(0, int(audible_limit)), planned)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            item = connection.execute(
+                """
+                SELECT notification_silent, notification_local_date, notification_position
+                FROM media_items
+                WHERE id = ?
+                """,
+                (media_item_id,),
+            ).fetchone()
+            if item is None:
+                raise ValueError(f"Media item {media_item_id} non trovato")
+            if item["notification_silent"] is not None:
+                plan = connection.execute(
+                    "SELECT planned_posts FROM notification_day_plans WHERE local_date = ?",
+                    (item["notification_local_date"],),
+                ).fetchone()
+                return NotificationPolicy(
+                    silent=bool(item["notification_silent"]),
+                    local_date=str(item["notification_local_date"]),
+                    position=int(item["notification_position"]),
+                    planned_posts=int(plan["planned_posts"]) if plan else planned,
+                )
+
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_day_plans(
+                    local_date, planned_posts, audible_limit, next_position, audible_reserved
+                )
+                VALUES(?, ?, ?, 0, 0)
+                """,
+                (local_date, planned, limit),
+            )
+            plan = connection.execute(
+                """
+                SELECT planned_posts, audible_limit, next_position, audible_reserved
+                FROM notification_day_plans
+                WHERE local_date = ?
+                """,
+                (local_date,),
+            ).fetchone()
+            position = int(plan["next_position"]) + 1
+            audible = (
+                position in audible_post_positions(int(plan["planned_posts"]), int(plan["audible_limit"]))
+                and int(plan["audible_reserved"]) < int(plan["audible_limit"])
+            )
+            connection.execute(
+                """
+                UPDATE notification_day_plans
+                SET next_position = ?, audible_reserved = audible_reserved + ?
+                WHERE local_date = ?
+                """,
+                (position, 1 if audible else 0, local_date),
+            )
+            connection.execute(
+                """
+                UPDATE media_items
+                SET notification_silent = ?, notification_local_date = ?, notification_position = ?
+                WHERE id = ?
+                """,
+                (0 if audible else 1, local_date, position, media_item_id),
+            )
+            return NotificationPolicy(
+                silent=not audible,
+                local_date=local_date,
+                position=position,
+                planned_posts=int(plan["planned_posts"]),
+            )
+
     def mark_removed(self, media_item_id: int) -> bool:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -764,6 +869,15 @@ class Store:
             video_width=optional_int(row, "video_width"),
             video_height=optional_int(row, "video_height"),
             video_duration=optional_int(row, "video_duration"),
+            notification_silent=(
+                bool(row["notification_silent"])
+                if "notification_silent" in row.keys() and row["notification_silent"] is not None
+                else None
+            ),
+            notification_local_date=(
+                row["notification_local_date"] if "notification_local_date" in row.keys() else None
+            ),
+            notification_position=optional_int(row, "notification_position"),
         )
 
 
