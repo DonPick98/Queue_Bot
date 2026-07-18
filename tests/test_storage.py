@@ -30,6 +30,7 @@ class StoreTests(unittest.TestCase):
                 balance_window=20,
                 default_queue_order="random",
                 default_timezone="Europe/Rome",
+                default_audible_posts_per_day=3,
                 default_posting_windows="all",
                 default_schedule_mode="anchored",
                 default_auto_backup_enabled=False,

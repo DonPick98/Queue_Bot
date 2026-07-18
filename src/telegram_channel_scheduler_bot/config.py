@@ -46,6 +46,19 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _audible_posts_per_day(name: str, default: int = 3) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} deve essere un numero intero tra 0 e 3.") from exc
+    if not 0 <= value <= 3:
+        raise ValueError(f"{name} deve essere compreso tra 0 e 3.")
+    return value
+
+
 def _batch_mode(name: str, default: str = "fixed") -> str:
     raw = os.getenv(name, default).strip().lower()
     if raw not in {"fixed", "auto"}:
@@ -92,6 +105,7 @@ class AppConfig:
     balance_window: int
     default_queue_order: str
     default_timezone: str
+    default_audible_posts_per_day: int
     default_posting_windows: str
     default_schedule_mode: str
     default_auto_backup_enabled: bool
@@ -125,6 +139,7 @@ class AppConfig:
             balance_window=_positive_int("BALANCE_WINDOW", 20),
             default_queue_order=_queue_order("DEFAULT_QUEUE_ORDER", "random"),
             default_timezone=validate_timezone(os.getenv("DEFAULT_TIMEZONE", DEFAULT_TIMEZONE)),
+            default_audible_posts_per_day=_audible_posts_per_day("DEFAULT_AUDIBLE_POSTS_PER_DAY", 3),
             default_posting_windows=_posting_windows("DEFAULT_POSTING_WINDOWS", DEFAULT_POSTING_WINDOWS),
             default_schedule_mode=_schedule_mode("DEFAULT_SCHEDULE_MODE", "anchored"),
             default_auto_backup_enabled=_bool("AUTO_BACKUP_ENABLED", False),

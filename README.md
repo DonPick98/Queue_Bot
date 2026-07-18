@@ -34,6 +34,7 @@ DEFAULT_PHOTO_RATIO=1
 DEFAULT_VIDEO_RATIO=1
 BALANCE_WINDOW=20
 DEFAULT_TIMEZONE=Europe/Rome
+DEFAULT_AUDIBLE_POSTS_PER_DAY=3
 DEFAULT_POSTING_WINDOWS=all
 AUTO_BACKUP_ENABLED=false
 AUTO_BACKUP_INTERVAL_MINUTES=1440
@@ -49,6 +50,8 @@ DATABASE_PATH=./data/bot.sqlite3
 ```
 
 Per trovare il tuo ID utente puoi scrivere a bot come `@userinfobot`, oppure avviare questo bot senza `ADMIN_USER_IDS`: il primo utente che invia `/start` diventa amministratore. Per sicurezza, e meglio impostare `ADMIN_USER_IDS` subito.
+
+`DEFAULT_AUDIBLE_POSTS_PER_DAY` controlla le notifiche dei soli post automatici nel canale contenuti. Accetta valori da `0` a `3`; con il valore predefinito e 12 post al giorno, i post 1, 5 e 9 hanno la notifica normale e gli altri vengono inviati silenziosamente. Foto e video restano sempre post Telegram singoli.
 
 ## Avvio
 

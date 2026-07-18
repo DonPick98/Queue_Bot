@@ -31,6 +31,7 @@ from telegram.ext import (
 from .balancer import PHOTO, VIDEO, choose_media_type
 from .config import AppConfig
 from .health import PUBLIC_URL_SETTING, normalize_public_base_url, start_http_server_from_env
+from .notifications import scheduled_posts_per_day
 from .posting_plan import (
     QUEUE_ALERT_HOURS,
     QueueCoverage,
@@ -1552,12 +1553,30 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
             break
 
         try:
+            notification_policy = None
+            notification_kwargs: dict[str, bool] = {}
+            if not manual:
+                timezone_name = get_timezone_name(store)
+                local_date = utcnow().astimezone(ZoneInfo(timezone_name)).date().isoformat()
+                planned_posts = scheduled_posts_per_day(
+                    store.get_int_setting("interval_minutes", 60),
+                    resolve_posts_per_run(store, queued),
+                    get_posting_windows(store),
+                )
+                notification_policy = store.get_or_assign_notification_policy(
+                    item.id,
+                    local_date,
+                    planned_posts,
+                    store.get_int_setting("audible_posts_per_day", 3),
+                )
+                notification_kwargs["disable_notification"] = notification_policy.silent
             if item.media_type == PHOTO:
                 sent_message = await application.bot.send_photo(
                     chat_id=channel_id,
                     photo=item.file_id,
                     caption=item.caption_html,
                     parse_mode=ParseMode.HTML if item.caption_html else None,
+                    **notification_kwargs,
                 )
             else:
                 sent_message = await application.bot.send_video(
@@ -1569,6 +1588,7 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
                     height=item.video_height,
                     duration=item.video_duration,
                     supports_streaming=True,
+                    **notification_kwargs,
                 )
         except TelegramError as exc:
             store.mark_failed(item.id, str(exc))
@@ -1585,6 +1605,18 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
             media_item_id=item.id,
         )
         store.set_setting("last_published_type", item.media_type)
+        LOGGER.info(
+            "Published paid-channel media item %s (%s), notification=%s%s",
+            item.id,
+            item.media_type,
+            "silent" if notification_policy and notification_policy.silent else "normal",
+            (
+                f", local_date={notification_policy.local_date}, "
+                f"position={notification_policy.position}/{notification_policy.planned_posts}"
+                if notification_policy
+                else ", manual=true"
+            ),
+        )
         if failures:
             return PublishOutcome(
                 status="published",
