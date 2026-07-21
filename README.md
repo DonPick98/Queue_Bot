@@ -212,8 +212,10 @@ Mouth Preview e un flusso separato dal canale Premium:
 - evita di ripetere la stessa sorgente nello stesso giorno;
 - invia la prima foto con notifica normale e la seconda silenziosa;
 - pubblica le foto senza caption e applica un watermark semitrasparente in basso a sinistra;
-- mantiene silenziosi welcome, upgrade card e recap settimanale;
-- crea una upgrade card ogni 6 anteprime e un mosaic settimanale con conteggi reali.
+- mantiene silenziosi welcome e recap settimanale;
+- non crea conversion card dopo un numero fisso di anteprime;
+- crea ogni settimana un mosaico riconoscibile con 9-12 thumbnail Premium, incluse quelle video;
+- usa i conteggi reali Premium e Preview; il test mostra subito l'avanzamento e non consuma il recap.
 
 Configurazione predefinita:
 

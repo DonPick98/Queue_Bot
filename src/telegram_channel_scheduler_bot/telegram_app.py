@@ -688,7 +688,7 @@ def build_dashboard_text(store: Store, view: str = "main") -> str:
                 f"Dimensione: {store.get_int_setting('preview_watermark_scale_percent', 10)}% del lato corto",
                 f"Opacità: {round(store.get_int_setting('preview_watermark_opacity', 64) / 255 * 100)}%",
                 f"Pinned: {'custom' if welcome_mode == 'custom' else 'default inglese'}",
-                "Upgrade card: ogni 6 immagini",
+                "Conversione: solo recap settimanale",
                 f"Recap: giorno {store.get_int_setting('preview_recap_weekday', 6)} alle {store.get_setting('preview_recap_time', '21:00')}",
                 "",
                 "I test non toccano coda o calendario; la foto manuale è una pubblicazione reale.",
@@ -999,15 +999,23 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         view = "preview"
     elif data == "dash:preview:test-watermark":
+        progress = await query.message.reply_text("Preparing the watermark test...")
         try:
             await send_preview_watermark_test(context.application, store, query.message.chat_id)
             note = "Test watermark inviato qui in chat; coda e conteggi invariati."
         except (TelegramError, OSError, ValueError) as exc:
             note = f"Test watermark non riuscito: {exc}"
+        try:
+            await progress.edit_text(note)
+        except TelegramError:
+            LOGGER.warning("Could not update watermark test progress", exc_info=True)
         view = "preview"
     elif data == "dash:preview:recap-confirm":
         view = "preview_recap_confirm"
     elif data == "dash:preview:recap-send":
+        progress = await query.message.reply_text(
+            "Creating the 9-12 tile weekly recap mosaic..."
+        )
         try:
             _, event = await WeeklyPreviewRecap(store).send_test(
                 context.application,
@@ -1019,6 +1027,10 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except (TelegramError, OSError, ValueError) as exc:
             note = f"Recap non riuscito: {exc}"
+        try:
+            await progress.edit_text(note)
+        except TelegramError:
+            LOGGER.warning("Could not update weekly recap test progress", exc_info=True)
         view = "preview"
     elif data == "dash:preview:photo-confirm":
         view = "preview_photo_confirm"
@@ -1314,6 +1326,7 @@ async def handle_admin_text_input(update: Update, context: ContextTypes.DEFAULT_
 async def preview_test_watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
+    progress = await update.effective_message.reply_text("Preparing the watermark test...")
     try:
         await send_preview_watermark_test(
             context.application,
@@ -1321,9 +1334,9 @@ async def preview_test_watermark_command(update: Update, context: ContextTypes.D
             update.effective_message.chat_id,
         )
     except (TelegramError, OSError, ValueError) as exc:
-        await update.effective_message.reply_text(f"Test watermark non riuscito: {exc}")
+        await progress.edit_text(f"Test watermark non riuscito: {exc}")
         return
-    await update.effective_message.reply_text(
+    await progress.edit_text(
         "Test completato nella chat admin. Coda, conteggi e calendario non sono cambiati."
     )
 
@@ -1337,15 +1350,18 @@ async def preview_recap_now_command(update: Update, context: ContextTypes.DEFAUL
             reply_markup=dashboard_keyboard(get_store(context), "preview_recap_confirm"),
         )
         return
+    progress = await update.effective_message.reply_text(
+        "Creating the 9-12 tile weekly recap mosaic..."
+    )
     try:
         message, event = await WeeklyPreviewRecap(get_store(context)).send_test(
             context.application,
             staging_chat_id=update.effective_message.chat_id,
         )
     except (TelegramError, OSError, ValueError) as exc:
-        await update.effective_message.reply_text(f"Recap non riuscito: {exc}")
+        await progress.edit_text(f"Recap non riuscito: {exc}")
         return
-    await update.effective_message.reply_text(
+    await progress.edit_text(
         f"Test recap pubblicato: {event.premium_count} contenuti Premium, "
         f"{event.preview_count} immagini Preview. Il recap settimanale resta intatto."
     )
@@ -2053,6 +2069,10 @@ async def publish_next(application: Application, manual: bool = False) -> Publis
         sent_photos = getattr(sent_message, "photo", None)
         if item.media_type == PHOTO and sent_photos:
             store.update_media_file_id(item.id, sent_photos[-1].file_id)
+        sent_video = getattr(sent_message, "video", None)
+        video_thumbnail = getattr(sent_video, "thumbnail", None)
+        if item.media_type == VIDEO and video_thumbnail:
+            store.update_media_preview_thumbnail_file_id(item.id, video_thumbnail.file_id)
         store.set_setting("last_published_type", item.media_type)
         LOGGER.info(
             "Published paid-channel media item %s (%s), notification=%s%s",

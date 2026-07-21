@@ -22,6 +22,7 @@ from telegram_channel_scheduler_bot.preview import (
     due_preview_slots,
     ensure_preview_welcome,
     recap_text,
+    select_mosaic_candidates,
     upgrade_text,
     welcome_text,
 )
@@ -40,6 +41,7 @@ class FakePreviewBot:
     def __init__(self) -> None:
         self.photos: list[dict[str, object]] = []
         self.failures_remaining: dict[str, int] = {}
+        self.unavailable_file_ids: set[str] = set()
         self.last_file_id = ""
         self.downloaded_file_ids: list[str] = []
         source = BytesIO()
@@ -47,6 +49,8 @@ class FakePreviewBot:
         self.photo_content = source.getvalue()
 
     async def get_file(self, file_id: str):
+        if file_id in self.unavailable_file_ids:
+            raise TelegramError("file is no longer available")
         self.last_file_id = file_id
         self.downloaded_file_ids.append(file_id)
         return FakeTelegramFile(self.photo_content)
@@ -98,6 +102,25 @@ class FakeRecoverBot(FakePreviewBot):
     async def delete_message(self, **kwargs):
         self.deleted.append(kwargs)
 
+
+
+class FakeVideoRecoverBot(FakePreviewBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forwarded: list[dict[str, object]] = []
+        self.deleted: list[dict[str, object]] = []
+
+    async def forward_message(self, **kwargs):
+        self.forwarded.append(kwargs)
+        return SimpleNamespace(
+            message_id=912,
+            video=SimpleNamespace(
+                thumbnail=SimpleNamespace(file_id="fresh-video-thumbnail")
+            ),
+        )
+
+    async def delete_message(self, **kwargs):
+        self.deleted.append(kwargs)
 
 class PreviewTests(unittest.IsolatedAsyncioTestCase):
     def make_store(self) -> Store:
@@ -161,14 +184,17 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(eligible_at, datetime(2026, 7, 12, 12, 30, tzinfo=UTC))
 
     def test_public_channel_copy_is_english(self):
-        event = SimpleNamespace(preview_count=6, premium_count=36)
+        event = SimpleNamespace(preview_count=14, premium_count=84)
 
         self.assertIn("You'll get two hand-picked images", welcome_text())
         self.assertIn("does not publish videos", welcome_text())
-        self.assertIn("You've seen 6 previews", upgrade_text(event))
-        self.assertIn("images only", upgrade_text(event))
-        self.assertIn("This week in Berry Premium", recap_text(event))
-        self.assertIn("Videos are not published in Mouth Preview", recap_text(event))
+        copy = recap_text(event)
+        self.assertEqual(upgrade_text(event), copy)
+        self.assertIn("You've seen 14 previews this week", copy)
+        self.assertIn("Mouth Aesthethics published 84 posts (videos too!)", copy)
+        self.assertIn("first month for <b>$1</b>", copy)
+        self.assertIn("then <b>$3/month</b>", copy)
+        self.assertNotIn("6 previews", copy)
 
     def test_due_slots_follow_project_timezone(self):
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 7, 59, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 0)
@@ -279,39 +305,69 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(selected.id, other.id)
 
-    def test_upgrade_event_uses_real_database_counts(self):
+    def test_sixth_preview_does_not_create_a_conversion_event(self):
         store = self.make_store()
-        items = [self.add_published(store, index) for index in range(1, 8)]
-        with store.connect() as connection:
-            for index, item in enumerate(items, start=1):
-                connection.execute(
-                    "UPDATE publish_log SET published_at = ? WHERE media_item_id = ?",
-                    (f"2026-07-{index:02d}T10:00:00+00:00", item.id),
-                )
-        for index, item in enumerate(items[:6], start=1):
+        items = [self.add_published(store, index) for index in range(1, 7)]
+        for index, item in enumerate(items, start=1):
             store.mark_preview_published(
                 item.id,
                 2000 + index,
                 f"2026-07-{index:02d}T12:00:00+00:00",
             )
 
-        event = PreviewConversionScheduler(store).ensure_upgrade_event("2026-07-07T00:00:00+00:00")
+        event = PreviewConversionScheduler(store).ensure_upgrade_event(
+            "2026-07-07T00:00:00+00:00"
+        )
 
-        self.assertIsNotNone(event)
-        self.assertEqual(event.preview_count, 6)
-        self.assertEqual(event.premium_count, 5)
-        self.assertEqual(event.event_key, "upgrade:6")
+        self.assertIsNone(event)
+        self.assertEqual(
+            store.pending_preview_conversion_events("2026-07-07T00:00:00+00:00"),
+            [],
+        )
 
-    def test_mosaic_keeps_thumbnails_recognisable(self):
+    def test_mosaic_keeps_nine_to_twelve_thumbnails_recognisable(self):
         images: list[bytes] = []
-        for colour in ("red", "green", "blue", "yellow"):
+        for index in range(12):
             source = BytesIO()
-            Image.new("RGB", (640, 480), colour).save(source, format="JPEG")
+            Image.new("RGB", (640, 480), (200 - index * 3, 150, 100)).save(
+                source,
+                format="JPEG",
+            )
             images.append(source.getvalue())
 
-        mosaic = build_mosaic(images, tile_size=100)
-        with Image.open(mosaic) as rendered:
-            self.assertEqual(rendered.size, (300, 200))
+        for count in range(9, 13):
+            with self.subTest(count=count):
+                mosaic = build_mosaic(images[:count], tile_size=100, video_indices=(1,))
+                with Image.open(mosaic) as rendered:
+                    expected_rows = 3 if count == 9 else 4
+                    self.assertEqual(rendered.size, (300, expected_rows * 100))
+                    red, green, blue = rendered.getpixel((50, 50))
+                    self.assertGreater(red, 155)
+                    self.assertGreater(green, 115)
+                    self.assertGreater(blue, 70)
+
+    def test_mosaic_selection_spans_the_week_and_includes_video(self):
+        store = self.make_store()
+        items = [
+            self.add_published(
+                store,
+                index,
+                media_type="video" if index % 5 == 0 else "photo",
+            )
+            for index in range(1, 26)
+        ]
+
+        selected = select_mosaic_candidates(
+            [store.find_media_by_id(item.id) for item in items],
+            display_limit=12,
+            candidate_limit=20,
+        )
+
+        self.assertEqual(len(selected), 20)
+        primary = selected[:12]
+        self.assertEqual(sum(item.media_type == "video" for item in primary), 3)
+        self.assertEqual(primary[0].id, items[0].id)
+        self.assertEqual(primary[-1].id, items[-1].id)
 
 
     def test_watermark_is_subtle_bottom_left_and_limits_working_size(self):
@@ -420,7 +476,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forced_weekly_recap_uses_real_counts_and_prevents_duplicate(self):
         store = self.make_store()
-        items = [self.add_published(store, index) for index in range(1, 4)]
+        items = [self.add_published(store, index) for index in range(1, 13)]
         now = datetime.now(UTC)
         store.mark_preview_published(
             items[0].id,
@@ -434,9 +490,10 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         repeated_message, repeated_event = await WeeklyPreviewRecap(store).force_send(app, now=now)
 
         self.assertIsNotNone(message)
-        self.assertEqual(event.premium_count, 3)
+        self.assertEqual(event.premium_count, 12)
         self.assertEqual(event.preview_count, 1)
-        self.assertIn("Premium published 3 photos and videos", bot.photos[0]["caption"])
+        self.assertIn("You've seen 1 preview this week", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthethics published 12 posts", bot.photos[0]["caption"])
         self.assertTrue(bot.photos[0]["disable_notification"])
         self.assertIsNone(repeated_message)
         self.assertEqual(repeated_event.event_key, event.event_key)
@@ -444,9 +501,9 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recap_test_does_not_consume_the_weekly_event(self):
         store = self.make_store()
-        item = self.add_published(store, 1)
+        items = [self.add_published(store, index) for index in range(1, 10)]
         now = datetime.now(UTC)
-        store.mark_preview_published(item.id, 3001, now.isoformat(timespec="seconds"))
+        store.mark_preview_published(items[0].id, 3001, now.isoformat(timespec="seconds"))
         bot = FakePreviewBot()
         recap = WeeklyPreviewRecap(store)
 
@@ -457,6 +514,50 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         weekly_event = recap.ensure_event(now=now, force=True)
         self.assertEqual(weekly_event.status, "pending")
         self.assertTrue(weekly_event.event_key.startswith("weekly:"))
+
+    async def test_recap_skips_broken_telegram_files_and_still_builds_nine_tiles(self):
+        store = self.make_store()
+        items = [self.add_published(store, index) for index in range(1, 13)]
+        bot = FakePreviewBot()
+        bot.unavailable_file_ids.update(item.file_id for item in items[:3])
+
+        await WeeklyPreviewRecap(store).send_test(
+            SimpleNamespace(bot=bot),
+            now=datetime.now(UTC),
+        )
+
+        self.assertEqual(len(bot.photos), 1)
+        with Image.open(bot.photos[0]["photo"]) as mosaic:
+            self.assertEqual(mosaic.size, (1080, 1080))
+
+
+    async def test_recap_recovers_and_persists_a_premium_video_thumbnail(self):
+        store = self.make_store()
+        store.set_setting("channel_id", "@premium")
+        _photos = [self.add_published(store, index) for index in range(1, 9)]
+        video = self.add_published(store, 9, media_type="video")
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET channel_message_id = ? WHERE id = ?",
+                (9009, video.id),
+            )
+        bot = FakeVideoRecoverBot()
+
+        await WeeklyPreviewRecap(store).send_test(
+            SimpleNamespace(bot=bot),
+            now=datetime.now(UTC),
+            staging_chat_id=99,
+        )
+
+        refreshed = store.find_media_by_id(video.id)
+        self.assertEqual(
+            refreshed.preview_thumbnail_file_id,
+            "fresh-video-thumbnail",
+        )
+        self.assertEqual(len(bot.forwarded), 1)
+        self.assertEqual(bot.forwarded[0]["message_id"], 9009)
+        self.assertEqual(len(bot.deleted), 1)
+        self.assertEqual(len(bot.photos), 1)
 
 
 if __name__ == "__main__":
