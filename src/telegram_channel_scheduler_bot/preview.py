@@ -6,12 +6,11 @@ from io import BytesIO
 import asyncio
 import hashlib
 import logging
-import math
 import re
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
@@ -22,9 +21,12 @@ LOGGER = logging.getLogger(__name__)
 PREVIEW_JOB_NAME = "mouth_preview_dispatcher"
 PREVIEW_JOB_INTERVAL_SECONDS = 300
 PREVIEW_MAX_POSTS_PER_DAY = 2
-PREVIEW_UPGRADE_FREQUENCY = 6
+PREVIEW_MOSAIC_MIN = 9
 PREVIEW_MOSAIC_LIMIT = 12
+PREVIEW_MOSAIC_CANDIDATE_LIMIT = 48
+PREVIEW_MOSAIC_DOWNLOAD_BATCH = 4
 PREVIEW_WATERMARK_MAX_DIMENSION = 2560
+PREMIUM_CHANNEL_NAME = "Mouth Aesthethics"
 
 PREVIEW_WELCOME_COPY_VERSION = "en-v1"
 REDDIT_CREATOR_CREDIT_RE = re.compile(r"u/[A-Za-z0-9_-]{3,20}")
@@ -91,6 +93,50 @@ def technical_quality(item: MediaItem) -> tuple[int, int]:
     return aspect_score, resolution_score
 
 
+def _evenly_spaced(items: list[MediaItem], count: int) -> list[MediaItem]:
+    items = list(items)
+    if count <= 0 or not items:
+        return []
+    if count >= len(items):
+        return items
+    if count == 1:
+        return [items[len(items) // 2]]
+
+    return [
+        items[round(index * (len(items) - 1) / (count - 1))]
+        for index in range(count)
+    ]
+
+
+def select_mosaic_candidates(
+    candidates: Iterable[MediaItem],
+    display_limit: int = PREVIEW_MOSAIC_LIMIT,
+    candidate_limit: int = PREVIEW_MOSAIC_CANDIDATE_LIMIT,
+) -> tuple[MediaItem, ...]:
+    ordered = list(candidates)
+    if not ordered:
+        return ()
+
+    display_limit = max(1, int(display_limit))
+    target = min(display_limit, len(ordered))
+    videos = [item for item in ordered if item.media_type == "video"]
+    photos = [item for item in ordered if item.media_type == "photo"]
+    video_target = min(3, len(videos), target)
+    photo_target = min(target - video_target, len(photos))
+    if photo_target < target - video_target:
+        video_target = min(len(videos), target - photo_target)
+
+    primary = _evenly_spaced(photos, photo_target) + _evenly_spaced(videos, video_target)
+    primary_ids = {item.id for item in primary}
+    positions = {item.id: index for index, item in enumerate(ordered)}
+    primary.sort(key=lambda item: positions[item.id])
+
+    remaining = [item for item in ordered if item.id not in primary_ids]
+    fallback_count = max(0, min(len(remaining), int(candidate_limit) - len(primary)))
+    fallback = _evenly_spaced(remaining, fallback_count)
+    return tuple(primary + fallback)
+
+
 def preview_creator_credit(item: MediaItem) -> str | None:
     source_id = str(item.source_id or "").strip().lower()
     caption = str(item.caption_html or "").strip()
@@ -139,7 +185,7 @@ class PreviewSelector:
 
 def upgrade_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Unlock the full MouthAesthetics feed →", url=url)]]
+        [[InlineKeyboardButton(f"Try {PREMIUM_CHANNEL_NAME}", url=url)]]
     )
 
 
@@ -154,22 +200,16 @@ def welcome_text() -> str:
 
 
 def upgrade_text(event: PreviewConversionEvent) -> str:
-    return (
-        f"You've seen {event.preview_count} previews. During the same period, Berry Premium "
-        f"published {event.premium_count} posts.\n\n"
-        "Mouth Preview is images only. Premium includes the complete feed: all photos and videos, "
-        "without the 48-hour delay.\n\n"
-        "Try the full feed for <b>$1</b> ↓"
-    )
+    return recap_text(event)
 
 
 def recap_text(event: PreviewConversionEvent) -> str:
+    preview_label = "preview" if event.preview_count == 1 else "previews"
+    post_label = "post" if event.premium_count == 1 else "posts"
     return (
-        "<b>This week in Berry Premium</b>\n\n"
-        f"Premium published {event.premium_count} photos and videos. "
-        f"Preview received {event.preview_count} images.\n\n"
-        "Videos are not published in Mouth Preview. Get the complete feed immediately "
-        "for <b>$1</b>."
+        f"You've seen {event.preview_count} {preview_label} this week. During the same period, "
+        f"{PREMIUM_CHANNEL_NAME} published {event.premium_count} {post_label} (videos too!).\n\n"
+        "Try your first month for <b>$1</b>, then <b>$3/month</b> \u2193"
     )
 
 
@@ -278,6 +318,67 @@ async def _download_preview_source(
                 LOGGER.warning("Could not delete temporary Preview recovery message", exc_info=True)
     return content, file_id
 
+async def _download_mosaic_source(
+    application,
+    store: Store,
+    item: MediaItem,
+    staging_chat_id: int | str | None = None,
+) -> bytes:
+    if item.media_type == "photo":
+        content, _ = await _download_preview_source(
+            application,
+            store,
+            item,
+            staging_chat_id=staging_chat_id,
+        )
+        return content
+
+    last_error: TelegramError | None = None
+    thumbnail_file_id = item.preview_thumbnail_file_id
+    if thumbnail_file_id:
+        try:
+            telegram_file = await application.bot.get_file(thumbnail_file_id)
+            return bytes(await telegram_file.download_as_bytearray())
+        except TelegramError as exc:
+            last_error = exc
+
+    if not item.channel_message_id:
+        if last_error is not None:
+            raise last_error
+        raise ValueError(f"Il video Premium #{item.id} non ha una thumbnail recuperabile.")
+
+    if staging_chat_id is None:
+        admin_ids = sorted(store.get_admin_ids())
+        staging_chat_id = admin_ids[0] if admin_ids else None
+    premium_channel_id = store.get_setting("channel_id")
+    if staging_chat_id is None or not premium_channel_id:
+        raise ValueError("Manca una chat admin per recuperare la thumbnail video Premium.")
+
+    forwarded_message = await application.bot.forward_message(
+        chat_id=staging_chat_id,
+        from_chat_id=premium_channel_id,
+        message_id=item.channel_message_id,
+        disable_notification=True,
+    )
+    try:
+        video = getattr(forwarded_message, "video", None)
+        thumbnail = getattr(video, "thumbnail", None)
+        if thumbnail is None:
+            raise ValueError("Il video Premium recuperato non contiene una thumbnail.")
+        thumbnail_file_id = thumbnail.file_id
+        store.update_media_preview_thumbnail_file_id(item.id, thumbnail_file_id)
+        telegram_file = await application.bot.get_file(thumbnail_file_id)
+        return bytes(await telegram_file.download_as_bytearray())
+    finally:
+        try:
+            await application.bot.delete_message(
+                chat_id=staging_chat_id,
+                message_id=forwarded_message.message_id,
+            )
+        except TelegramError:
+            LOGGER.warning("Could not delete temporary video-thumbnail message", exc_info=True)
+
+
 
 async def prepare_preview_photo(
     application,
@@ -304,26 +405,78 @@ async def prepare_preview_photo(
     )
 
 
-def build_mosaic(images: Iterable[bytes], tile_size: int = 360) -> BytesIO:
-    prepared: list[Image.Image] = []
-    for content in images:
+def _add_video_badge(image: Image.Image) -> Image.Image:
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    diameter = max(36, round(min(image.size) * 0.16))
+    margin = max(12, round(min(image.size) * 0.05))
+    left = image.width - margin - diameter
+    top = margin
+    draw.ellipse(
+        (left, top, left + diameter, top + diameter),
+        fill=(10, 8, 12, 150),
+        outline=(255, 255, 255, 190),
+        width=max(2, diameter // 24),
+    )
+    inset = diameter * 0.29
+    draw.polygon(
+        (
+            (left + inset, top + inset * 0.72),
+            (left + inset, top + diameter - inset * 0.72),
+            (left + diameter - inset * 0.68, top + diameter / 2),
+        ),
+        fill=(255, 255, 255, 225),
+    )
+    return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+
+
+def build_mosaic(
+    images: Iterable[bytes],
+    tile_size: int = 360,
+    video_indices: Iterable[int] = (),
+) -> BytesIO:
+    video_indices = set(video_indices)
+    prepared: list[tuple[Image.Image, bool]] = []
+    for index, content in enumerate(images):
         try:
             with Image.open(BytesIO(content)) as source:
-                tile = ImageOps.fit(source.convert("RGB"), (tile_size, tile_size), method=Image.Resampling.LANCZOS)
-                prepared.append(ImageEnhance.Brightness(tile).enhance(0.82))
+                image = ImageOps.exif_transpose(source).convert("RGB").copy()
+            prepared.append((image, index in video_indices))
         except Exception:
             LOGGER.warning("Skipping unreadable Preview recap thumbnail", exc_info=True)
     if not prepared:
         raise ValueError("Nessuna miniatura valida per il recap Preview")
 
     columns = 3
-    rows = math.ceil(len(prepared) / columns)
-    canvas = Image.new("RGB", (columns * tile_size, rows * tile_size), "#120d12")
-    for index, tile in enumerate(prepared):
-        canvas.paste(tile, ((index % columns) * tile_size, (index // columns) * tile_size))
+    if len(prepared) == 10:
+        row_counts = (3, 3, 2, 2)
+    else:
+        full_rows, remainder = divmod(len(prepared), columns)
+        row_counts = (columns,) * full_rows + ((remainder,) if remainder else ())
+    rows = len(row_counts)
+    canvas_width = columns * tile_size
+    canvas = Image.new("RGB", (canvas_width, rows * tile_size), "#120d12")
+    gap = max(2, tile_size // 90)
+
+    offset = 0
+    for row, row_count in enumerate(row_counts):
+        row_items = prepared[offset : offset + row_count]
+        offset += row_count
+        cell_width = canvas_width // len(row_items)
+        for column, (source, is_video) in enumerate(row_items):
+            left = column * cell_width
+            right = canvas_width if column == len(row_items) - 1 else (column + 1) * cell_width
+            target = (max(1, right - left - gap * 2), max(1, tile_size - gap * 2))
+            tile = ImageOps.fit(source, target, method=Image.Resampling.LANCZOS)
+            tile = tile.filter(ImageFilter.GaussianBlur(radius=max(3.0, tile_size / 48)))
+            tile = ImageEnhance.Brightness(tile).enhance(0.58)
+            if is_video:
+                tile = _add_video_badge(tile)
+            canvas.paste(tile, (left + gap, row * tile_size + gap))
+
     output = BytesIO()
     output.name = "berry-premium-weekly-preview.jpg"
-    canvas.save(output, format="JPEG", quality=88, optimize=True)
+    canvas.save(output, format="JPEG", quality=92, optimize=True)
     output.seek(0)
     return output
 
@@ -384,7 +537,6 @@ class PreviewPublisher:
                 local_date,
                 policy.position,
             )
-            PreviewConversionScheduler(self.store).ensure_upgrade_event(published_at)
         return sent_count
 
     async def publish_one_now(
@@ -427,7 +579,6 @@ class PreviewPublisher:
             raise
         published_at = utcnow().isoformat(timespec="seconds")
         self.store.mark_preview_published(item.id, sent.message_id, published_at)
-        PreviewConversionScheduler(self.store).ensure_upgrade_event(published_at)
         LOGGER.info("Manually published Mouth Preview photo %s", item.id)
         return self.store.find_media_by_id(item.id) or item
 
@@ -437,24 +588,8 @@ class PreviewConversionScheduler:
     store: Store
 
     def ensure_upgrade_event(self, now_iso: str) -> PreviewConversionEvent | None:
-        total = self.store.preview_count()
-        if total < PREVIEW_UPGRADE_FREQUENCY or total % PREVIEW_UPGRADE_FREQUENCY:
-            return None
-        timestamps = self.store.latest_preview_timestamps(PREVIEW_UPGRADE_FREQUENCY)
-        if len(timestamps) < PREVIEW_UPGRADE_FREQUENCY:
-            return None
-        start_at = timestamps[0]
-        return self.store.create_preview_conversion_event(
-            "upgrade",
-            f"upgrade:{total}",
-            now_iso,
-            start_at,
-            now_iso,
-            self.store.premium_count_between(start_at, now_iso),
-            PREVIEW_UPGRADE_FREQUENCY,
-            (),
-            self.store.get_setting("preview_memberpass_link_version", "v1") or "v1",
-        )
+        LOGGER.debug("Skipping legacy six-preview conversion event at %s", now_iso)
+        return None
 
     async def send_pending(self, application, now: datetime | None = None) -> int:
         channel_id = self.store.get_setting("preview_channel_id")
@@ -463,23 +598,15 @@ class PreviewConversionScheduler:
         now = now or utcnow()
         sent_count = 0
         for event in self.store.pending_preview_conversion_events(now.isoformat()):
+            if event.kind != "weekly_recap":
+                self.store.dismiss_preview_conversion_event(
+                    event.id,
+                    "Disabled: conversion posts are weekly only.",
+                )
+                LOGGER.info("Dismissed legacy Mouth Preview conversion %s", event.event_key)
+                continue
             try:
-                if event.kind == "weekly_recap":
-                    message = await WeeklyPreviewRecap(self.store).send_event(application, event)
-                else:
-                    message = await application.bot.send_message(
-                        chat_id=channel_id,
-                        text=upgrade_text(event),
-                        parse_mode="HTML",
-                        reply_markup=upgrade_keyboard(
-                            self.store.get_setting(
-                                "preview_memberpass_url",
-                                "https://my.memberpass.net/306354e7c4",
-                            )
-                            or "https://my.memberpass.net/306354e7c4"
-                        ),
-                        disable_notification=True,
-                    )
+                message = await WeeklyPreviewRecap(self.store).send_event(application, event)
             except (TelegramError, ValueError) as exc:
                 self.store.mark_preview_conversion_failed(event.id, str(exc))
                 LOGGER.warning("Mouth Preview conversion %s failed", event.event_key, exc_info=True)
@@ -493,6 +620,14 @@ class PreviewConversionScheduler:
 @dataclass
 class WeeklyPreviewRecap:
     store: Store
+
+    def _mosaic_candidate_ids(self, start_at: str, end_at: str) -> tuple[int, ...]:
+        candidates = self.store.published_mosaic_candidates_between(
+            start_at,
+            end_at,
+            PREVIEW_MOSAIC_CANDIDATE_LIMIT * 4,
+        )
+        return tuple(item.id for item in select_mosaic_candidates(candidates))
 
     def ensure_event(self, now: datetime | None = None, force: bool = False) -> PreviewConversionEvent | None:
         now = now or utcnow()
@@ -515,7 +650,7 @@ class WeeklyPreviewRecap:
             end_at,
             self.store.premium_count_between(start_at, end_at),
             self.store.preview_count_between(start_at, end_at),
-            self.store.published_photo_ids_between(start_at, end_at, PREVIEW_MOSAIC_LIMIT),
+            self._mosaic_candidate_ids(start_at, end_at),
             self.store.get_setting("preview_memberpass_link_version", "v1") or "v1",
         )
 
@@ -537,11 +672,7 @@ class WeeklyPreviewRecap:
             end_at=end_at,
             premium_count=self.store.premium_count_between(start_at, end_at),
             preview_count=self.store.preview_count_between(start_at, end_at),
-            media_item_ids=self.store.published_photo_ids_between(
-                start_at,
-                end_at,
-                PREVIEW_MOSAIC_LIMIT,
-            ),
+            media_item_ids=self._mosaic_candidate_ids(start_at, end_at),
             memberpass_link_version=(
                 self.store.get_setting("preview_memberpass_link_version", "v1") or "v1"
             ),
@@ -556,21 +687,64 @@ class WeeklyPreviewRecap:
         event: PreviewConversionEvent,
         staging_chat_id: int | str | None = None,
     ):
+        channel_id = self.store.get_setting("preview_channel_id")
+        if not channel_id:
+            raise ValueError("Configura prima il canale Mouth Preview.")
+
+        candidate_items = [
+            item
+            for media_id in event.media_item_ids
+            if (item := self.store.find_media_by_id(media_id)) is not None
+        ]
         contents: list[bytes] = []
-        for media_id in event.media_item_ids:
-            item = self.store.find_media_by_id(media_id)
-            if item is None:
-                continue
-            content, _ = await _download_preview_source(
-                application,
-                self.store,
-                item,
-                staging_chat_id=staging_chat_id,
+        media_types: list[str] = []
+
+        async def load(item: MediaItem) -> tuple[bytes | None, Exception | None]:
+            try:
+                content = await _download_mosaic_source(
+                    application,
+                    self.store,
+                    item,
+                    staging_chat_id=staging_chat_id,
+                )
+                with Image.open(BytesIO(content)) as thumbnail:
+                    thumbnail.verify()
+                return content, None
+            except (TelegramError, OSError, ValueError) as exc:
+                return None, exc
+
+        for offset in range(0, len(candidate_items), PREVIEW_MOSAIC_DOWNLOAD_BATCH):
+            batch = candidate_items[offset : offset + PREVIEW_MOSAIC_DOWNLOAD_BATCH]
+            results = await asyncio.gather(*(load(item) for item in batch))
+            for item, (content, error) in zip(batch, results):
+                if error is not None:
+                    LOGGER.warning(
+                        "Skipping unavailable weekly recap media %s: %s",
+                        item.id,
+                        error,
+                    )
+                    continue
+                if content is not None:
+                    contents.append(content)
+                    media_types.append(item.media_type)
+                if len(contents) >= PREVIEW_MOSAIC_LIMIT:
+                    break
+            if len(contents) >= PREVIEW_MOSAIC_LIMIT:
+                break
+
+        if len(contents) < PREVIEW_MOSAIC_MIN:
+            raise ValueError(
+                "Recap non creato: servono almeno "
+                f"{PREVIEW_MOSAIC_MIN} thumbnail Premium recuperabili; "
+                f"trovate {len(contents)} su {len(candidate_items)}."
             )
-            contents.append(content)
-        mosaic = build_mosaic(contents)
+
+        video_indices = [
+            index for index, media_type in enumerate(media_types) if media_type == "video"
+        ]
+        mosaic = await asyncio.to_thread(build_mosaic, contents, 360, video_indices)
         return await application.bot.send_photo(
-            chat_id=self.store.get_setting("preview_channel_id"),
+            chat_id=channel_id,
             photo=mosaic,
             caption=recap_text(event),
             parse_mode="HTML",

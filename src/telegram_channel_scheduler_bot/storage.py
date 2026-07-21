@@ -54,6 +54,7 @@ class MediaItem:
     media_width: int | None = None
     media_height: int | None = None
     channel_message_id: int | None = None
+    preview_thumbnail_file_id: str | None = None
     preview_eligible_at: str | None = None
     preview_published_at: str | None = None
     preview_message_id: int | None = None
@@ -140,6 +141,7 @@ class Store:
                     ),
                     published_at TEXT,
                     channel_message_id INTEGER,
+                    preview_thumbnail_file_id TEXT,
                     failed_attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     content_fingerprint TEXT,
@@ -230,6 +232,7 @@ class Store:
             self._ensure_column(connection, "media_items", "derived_tags_json TEXT")
             self._ensure_column(connection, "media_items", "media_width INTEGER")
             self._ensure_column(connection, "media_items", "media_height INTEGER")
+            self._ensure_column(connection, "media_items", "preview_thumbnail_file_id TEXT")
             self._ensure_column(connection, "media_items", "preview_eligible_at TEXT")
             self._ensure_column(connection, "media_items", "preview_published_at TEXT")
             self._ensure_column(connection, "media_items", "preview_message_id INTEGER")
@@ -421,6 +424,13 @@ class Store:
         with self.connect() as connection:
             connection.execute(
                 "UPDATE media_items SET file_id = ? WHERE id = ?",
+                (file_id, media_item_id),
+            )
+
+    def update_media_preview_thumbnail_file_id(self, media_item_id: int, file_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET preview_thumbnail_file_id = ? WHERE id = ?",
                 (file_id, media_item_id),
             )
 
@@ -1029,6 +1039,27 @@ class Store:
             ).fetchall()
         return tuple(int(row["id"]) for row in reversed(rows))
 
+    def published_mosaic_candidates_between(
+        self,
+        start_at: str,
+        end_at: str,
+        limit: int = 256,
+    ) -> list[MediaItem]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM media_items
+                WHERE status = ?
+                  AND media_type IN (?, ?)
+                  AND published_at >= ?
+                  AND published_at < ?
+                ORDER BY published_at ASC, id ASC
+                LIMIT ?
+                """,
+                (PUBLISHED, PHOTO, VIDEO, start_at, end_at, max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_media_item(row) for row in rows]
+
     def create_preview_conversion_event(
         self,
         kind: str,
@@ -1088,6 +1119,17 @@ class Store:
                 WHERE id = ?
                 """,
                 (message_id, event_id),
+            )
+
+    def dismiss_preview_conversion_event(self, event_id: int, reason: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preview_conversion_events
+                SET status = 'sent', message_id = NULL, error = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (reason[:1000], event_id),
             )
 
     def mark_preview_conversion_failed(self, event_id: int, error: str) -> None:
@@ -1336,6 +1378,11 @@ class Store:
             media_width=optional_int(row, "media_width"),
             media_height=optional_int(row, "media_height"),
             channel_message_id=optional_int(row, "channel_message_id"),
+            preview_thumbnail_file_id=(
+                row["preview_thumbnail_file_id"]
+                if "preview_thumbnail_file_id" in row.keys()
+                else None
+            ),
             preview_eligible_at=(row["preview_eligible_at"] if "preview_eligible_at" in row.keys() else None),
             preview_published_at=(row["preview_published_at"] if "preview_published_at" in row.keys() else None),
             preview_message_id=optional_int(row, "preview_message_id"),
