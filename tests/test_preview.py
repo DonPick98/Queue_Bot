@@ -325,7 +325,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    def test_mosaic_keeps_nine_to_twelve_thumbnails_recognisable(self):
+    def test_mosaic_teases_without_clearly_revealing_nine_to_twelve_thumbnails(self):
         images: list[bytes] = []
         for index in range(12):
             source = BytesIO()
@@ -342,9 +342,12 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
                     expected_rows = 3 if count == 9 else 4
                     self.assertEqual(rendered.size, (300, expected_rows * 100))
                     red, green, blue = rendered.getpixel((50, 50))
-                    self.assertGreater(red, 155)
-                    self.assertGreater(green, 115)
-                    self.assertGreater(blue, 70)
+                    self.assertGreater(red, 100)
+                    self.assertLess(red, 140)
+                    self.assertGreater(green, 70)
+                    self.assertLess(green, 105)
+                    self.assertGreater(blue, 40)
+                    self.assertLess(blue, 80)
 
     def test_mosaic_selection_spans_the_week_and_includes_video(self):
         store = self.make_store()

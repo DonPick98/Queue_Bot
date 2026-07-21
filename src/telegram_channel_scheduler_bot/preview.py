@@ -10,7 +10,7 @@ import re
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
@@ -468,7 +468,8 @@ def build_mosaic(
             right = canvas_width if column == len(row_items) - 1 else (column + 1) * cell_width
             target = (max(1, right - left - gap * 2), max(1, tile_size - gap * 2))
             tile = ImageOps.fit(source, target, method=Image.Resampling.LANCZOS)
-            tile = ImageEnhance.Brightness(tile).enhance(0.90)
+            tile = tile.filter(ImageFilter.GaussianBlur(radius=max(3.0, tile_size / 48)))
+            tile = ImageEnhance.Brightness(tile).enhance(0.58)
             if is_video:
                 tile = _add_video_badge(tile)
             canvas.paste(tile, (left + gap, row * tile_size + gap))

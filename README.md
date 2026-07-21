@@ -214,7 +214,7 @@ Mouth Preview e un flusso separato dal canale Premium:
 - pubblica le foto senza caption e applica un watermark semitrasparente in basso a sinistra;
 - mantiene silenziosi welcome e recap settimanale;
 - non crea conversion card dopo un numero fisso di anteprime;
-- crea ogni settimana un mosaico riconoscibile con 9-12 thumbnail Premium, incluse quelle video;
+- crea ogni settimana un mosaico sfocato e oscurato con 9-12 thumbnail foto/video: invita all'acquisto senza mostrare chiaramente i contenuti;
 - usa i conteggi reali Premium e Preview; il test mostra subito l'avanzamento e non consuma il recap.
 
 Configurazione predefinita:
