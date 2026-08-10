@@ -1,6 +1,8 @@
 from contextlib import suppress
+import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from telegram_channel_scheduler_bot.config import AppConfig
@@ -50,6 +52,28 @@ class StoreTests(unittest.TestCase):
     def unlink_if_possible(path: Path) -> None:
         with suppress(OSError):
             path.unlink(missing_ok=True)
+
+    def test_bootstrap_migrates_legacy_memberpass_settings(self):
+        store = self.make_store()
+        store.set_setting("preview_memberpass_url", "https://my.memberpass.net/306354e7c4")
+        store.set_setting("preview_memberpass_link_version", "v1")
+        store.set_setting("preview_memberpass_synced_version", "v1")
+        with patch.dict(
+            os.environ,
+            {
+                "PREVIEW_MEMBERPASS_URL": "https://my.memberpass.net/306354e7c4",
+                "PREVIEW_MEMBERPASS_LINK_VERSION": "v1",
+            },
+            clear=True,
+        ):
+            store.bootstrap(AppConfig.from_env())
+
+        self.assertEqual(
+            store.get_setting("preview_memberpass_url"),
+            "https://my.subscriby.net/306354e7c4",
+        )
+        self.assertEqual(store.get_setting("preview_memberpass_link_version"), "v2")
+        self.assertIsNone(store.get_setting("preview_memberpass_synced_version"))
 
     def test_add_media_rejects_duplicate_queue_item(self):
         store = self.make_store()

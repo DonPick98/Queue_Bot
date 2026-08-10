@@ -10,7 +10,12 @@ import sqlite3
 from typing import Iterable, Iterator
 
 from .balancer import PHOTO, VIDEO
-from .config import AppConfig
+from .config import (
+    AppConfig,
+    LEGACY_PREVIEW_MEMBERPASS_URLS,
+    PREVIEW_MEMBERPASS_LINK_VERSION,
+    PREVIEW_MEMBERPASS_URL,
+)
 from .notifications import MAX_AUDIBLE_POSTS_PER_DAY, audible_post_positions
 
 
@@ -358,6 +363,34 @@ class Store:
                 connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                     (key, value),
+                )
+            memberpass_url = connection.execute(
+                "SELECT value FROM settings WHERE key = 'preview_memberpass_url'"
+            ).fetchone()
+            memberpass_link_version = connection.execute(
+                "SELECT value FROM settings WHERE key = 'preview_memberpass_link_version'"
+            ).fetchone()
+            stored_memberpass_url = memberpass_url["value"] if memberpass_url else ""
+            stored_link_version = (
+                memberpass_link_version["value"] if memberpass_link_version else ""
+            )
+            if (
+                stored_memberpass_url in LEGACY_PREVIEW_MEMBERPASS_URLS
+                or (
+                    stored_memberpass_url == PREVIEW_MEMBERPASS_URL
+                    and stored_link_version != PREVIEW_MEMBERPASS_LINK_VERSION
+                )
+            ):
+                connection.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'preview_memberpass_url'",
+                    (PREVIEW_MEMBERPASS_URL,),
+                )
+                connection.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'preview_memberpass_link_version'",
+                    (PREVIEW_MEMBERPASS_LINK_VERSION,),
+                )
+                connection.execute(
+                    "DELETE FROM settings WHERE key = 'preview_memberpass_synced_version'"
                 )
             watermark_style_version = connection.execute(
                 "SELECT value FROM settings WHERE key = 'preview_watermark_style_version'"
@@ -964,7 +997,10 @@ class Store:
         variant: str = "full_photo",
         memberpass_link_version: str | None = None,
     ) -> None:
-        link_version = memberpass_link_version or self.get_setting("preview_memberpass_link_version", "v1") or "v1"
+        link_version = memberpass_link_version or self.get_setting(
+            "preview_memberpass_link_version",
+            PREVIEW_MEMBERPASS_LINK_VERSION,
+        ) or PREVIEW_MEMBERPASS_LINK_VERSION
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1119,6 +1155,39 @@ class Store:
                 WHERE id = ?
                 """,
                 (message_id, event_id),
+            )
+
+    def preview_recap_events_needing_link_sync(
+        self,
+        memberpass_link_version: str,
+    ) -> list[PreviewConversionEvent]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM preview_conversion_events
+                WHERE kind = 'weekly_recap'
+                  AND status = 'sent'
+                  AND message_id IS NOT NULL
+                  AND memberpass_link_version != ?
+                ORDER BY id ASC
+                """,
+                (memberpass_link_version,),
+            ).fetchall()
+        return [self._row_to_preview_event(row) for row in rows]
+
+    def mark_preview_conversion_link_synced(
+        self,
+        event_id: int,
+        memberpass_link_version: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE preview_conversion_events
+                SET memberpass_link_version = ?
+                WHERE id = ?
+                """,
+                (memberpass_link_version, event_id),
             )
 
     def dismiss_preview_conversion_event(self, event_id: int, reason: str) -> None:

@@ -8,6 +8,13 @@ from .queue_order import parse_queue_order
 from .scheduling import DEFAULT_POSTING_WINDOWS, DEFAULT_TIMEZONE, parse_posting_windows, validate_timezone
 
 
+PREVIEW_MEMBERPASS_URL = "https://my.subscriby.net/306354e7c4"
+PREVIEW_MEMBERPASS_LINK_VERSION = "v2"
+LEGACY_PREVIEW_MEMBERPASS_URLS = frozenset(
+    {"https://my.memberpass.net/306354e7c4"}
+)
+
+
 def _load_dotenv_if_available() -> None:
     try:
         from dotenv import load_dotenv
@@ -121,8 +128,8 @@ class AppConfig:
     preview_delay_hours: int = 48
     preview_posts_per_day: int = 2
     preview_posting_times: str = "10:00,20:00"
-    preview_memberpass_url: str = "https://my.memberpass.net/306354e7c4"
-    preview_memberpass_link_version: str = "v1"
+    preview_memberpass_url: str = PREVIEW_MEMBERPASS_URL
+    preview_memberpass_link_version: str = PREVIEW_MEMBERPASS_LINK_VERSION
     preview_attribution: str = "@MouthPreview · Full daily feed ↓"
     preview_watermark_enabled: bool = True
     preview_watermark_text: str = "@MouthPreview"
@@ -138,6 +145,25 @@ class AppConfig:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         database_path = Path(os.getenv("DATABASE_PATH", "./data/bot.sqlite3")).expanduser()
         channel_id = os.getenv("TELEGRAM_CHANNEL_ID", "").strip() or None
+        preview_memberpass_url = (
+            os.getenv("PREVIEW_MEMBERPASS_URL", PREVIEW_MEMBERPASS_URL).strip()
+            or PREVIEW_MEMBERPASS_URL
+        )
+        preview_memberpass_link_version = (
+            os.getenv(
+                "PREVIEW_MEMBERPASS_LINK_VERSION",
+                PREVIEW_MEMBERPASS_LINK_VERSION,
+            ).strip()
+            or PREVIEW_MEMBERPASS_LINK_VERSION
+        )
+        if preview_memberpass_url in LEGACY_PREVIEW_MEMBERPASS_URLS:
+            preview_memberpass_url = PREVIEW_MEMBERPASS_URL
+            preview_memberpass_link_version = PREVIEW_MEMBERPASS_LINK_VERSION
+        elif (
+            preview_memberpass_url == PREVIEW_MEMBERPASS_URL
+            and preview_memberpass_link_version == "v1"
+        ):
+            preview_memberpass_link_version = PREVIEW_MEMBERPASS_LINK_VERSION
 
         return cls(
             bot_token=token,
@@ -173,15 +199,8 @@ class AppConfig:
             preview_posts_per_day=_positive_int("PREVIEW_POSTS_PER_DAY", 2),
             preview_posting_times=os.getenv("PREVIEW_POSTING_TIMES", "10:00,20:00").strip()
             or "10:00,20:00",
-            preview_memberpass_url=os.getenv(
-                "PREVIEW_MEMBERPASS_URL",
-                "https://my.memberpass.net/306354e7c4",
-            ).strip(),
-            preview_memberpass_link_version=os.getenv(
-                "PREVIEW_MEMBERPASS_LINK_VERSION",
-                "v1",
-            ).strip()
-            or "v1",
+            preview_memberpass_url=preview_memberpass_url,
+            preview_memberpass_link_version=preview_memberpass_link_version,
             preview_attribution=os.getenv(
                 "PREVIEW_ATTRIBUTION",
                 "@MouthPreview · Full daily feed ↓",

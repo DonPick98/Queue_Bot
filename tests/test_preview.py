@@ -18,6 +18,7 @@ from telegram_channel_scheduler_bot.preview import (
     prepare_preview_photo,
     preview_welcome_version,
     set_preview_welcome,
+    sync_preview_memberpass_links,
     build_mosaic,
     due_preview_slots,
     ensure_preview_welcome,
@@ -69,6 +70,7 @@ class FakeWelcomeBot:
         self.messages: list[dict[str, object]] = []
         self.pins: list[dict[str, object]] = []
         self.deletions: list[dict[str, object]] = []
+        self.edits: list[dict[str, object]] = []
 
     async def send_message(self, **kwargs):
         self.messages.append(kwargs)
@@ -79,6 +81,9 @@ class FakeWelcomeBot:
 
     async def delete_message(self, **kwargs):
         self.deletions.append(kwargs)
+
+    async def edit_message_reply_markup(self, **kwargs):
+        self.edits.append(kwargs)
 
 
 class FakeRecoverBot(FakePreviewBot):
@@ -220,6 +225,54 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         stored_version = store.get_setting("preview_welcome_version")
         self.assertEqual(stored_version, preview_welcome_version(store))
         self.assertTrue(stored_version.startswith("en-v1:v1:default:"))
+
+    async def test_memberpass_link_sync_updates_pinned_and_all_sent_recaps(self):
+        store = self.make_store()
+        store.set_setting("preview_memberpass_url", "https://my.subscriby.net/306354e7c4")
+        store.set_setting("preview_memberpass_link_version", "v2")
+        store.set_setting("preview_welcome_message_id", "144")
+        store.set_setting("preview_welcome_version", "en-v1:v1:default:old")
+        first = store.create_preview_conversion_event(
+            "weekly_recap",
+            "weekly:2026-W30",
+            "2026-07-26T19:00:00+00:00",
+            "2026-07-20T00:00:00+00:00",
+            "2026-07-26T19:00:00+00:00",
+            84,
+            14,
+            (),
+            "v1",
+        )
+        second = store.create_preview_conversion_event(
+            "weekly_recap",
+            "weekly:2026-W31",
+            "2026-08-02T19:00:00+00:00",
+            "2026-07-27T00:00:00+00:00",
+            "2026-08-02T19:00:00+00:00",
+            80,
+            14,
+            (),
+            "v1",
+        )
+        store.mark_preview_conversion_sent(first.id, 4001)
+        store.mark_preview_conversion_sent(second.id, 4002)
+        bot = FakeWelcomeBot()
+
+        synced = await sync_preview_memberpass_links(SimpleNamespace(bot=bot), store)
+
+        self.assertTrue(synced)
+        self.assertEqual(
+            [edit["message_id"] for edit in bot.edits],
+            [144, 4001, 4002],
+        )
+        for edit in bot.edits:
+            self.assertEqual(
+                edit["reply_markup"].inline_keyboard[0][0].url,
+                "https://my.subscriby.net/306354e7c4",
+            )
+        self.assertEqual(store.get_setting("preview_memberpass_synced_version"), "v2")
+        self.assertTrue(store.get_setting("preview_welcome_version").startswith("en-v1:v2:"))
+        self.assertEqual(store.preview_recap_events_needing_link_sync("v2"), [])
 
     async def test_preview_publishes_two_individual_photos_and_never_video(self):
         store = self.make_store()

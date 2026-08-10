@@ -47,6 +47,7 @@ from .preview import (
     prepare_preview_photo,
     schedule_preview,
     set_preview_welcome,
+    sync_preview_memberpass_links,
 )
 from .queue_order import parse_queue_order
 from .scheduling import (
@@ -2323,13 +2324,21 @@ async def configure_bot_commands(application: Application) -> None:
         LOGGER.warning("Could not update Telegram command menu", exc_info=True)
 
 
+async def initialize_bot(application: Application) -> None:
+    await configure_bot_commands(application)
+    try:
+        await sync_preview_memberpass_links(application, application.bot_data["store"])
+    except Exception:
+        LOGGER.exception("Could not sync Mouth Preview MemberPass links during startup")
+
+
 def build_application(config: AppConfig) -> Application:
     auto_restore_state(config)
     store = Store(config.database_path)
     store.initialize()
     store.bootstrap(config)
 
-    application = ApplicationBuilder().token(config.bot_token).post_init(configure_bot_commands).build()
+    application = ApplicationBuilder().token(config.bot_token).post_init(initialize_bot).build()
     application.bot_data["store"] = store
 
     application.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^dash:"))

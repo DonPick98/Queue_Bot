@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
+from .config import PREVIEW_MEMBERPASS_LINK_VERSION, PREVIEW_MEMBERPASS_URL
 from .storage import MediaItem, PreviewConversionEvent, Store
 
 
@@ -651,7 +652,11 @@ class WeeklyPreviewRecap:
             self.store.premium_count_between(start_at, end_at),
             self.store.preview_count_between(start_at, end_at),
             self._mosaic_candidate_ids(start_at, end_at),
-            self.store.get_setting("preview_memberpass_link_version", "v1") or "v1",
+            self.store.get_setting(
+                "preview_memberpass_link_version",
+                PREVIEW_MEMBERPASS_LINK_VERSION,
+            )
+            or PREVIEW_MEMBERPASS_LINK_VERSION,
         )
 
     def build_test_event(self, now: datetime | None = None) -> PreviewConversionEvent:
@@ -674,7 +679,11 @@ class WeeklyPreviewRecap:
             preview_count=self.store.preview_count_between(start_at, end_at),
             media_item_ids=self._mosaic_candidate_ids(start_at, end_at),
             memberpass_link_version=(
-                self.store.get_setting("preview_memberpass_link_version", "v1") or "v1"
+                self.store.get_setting(
+                    "preview_memberpass_link_version",
+                    PREVIEW_MEMBERPASS_LINK_VERSION,
+                )
+                or PREVIEW_MEMBERPASS_LINK_VERSION
             ),
             message_id=None,
             attempts=0,
@@ -751,9 +760,9 @@ class WeeklyPreviewRecap:
             reply_markup=upgrade_keyboard(
                 self.store.get_setting(
                     "preview_memberpass_url",
-                    "https://my.memberpass.net/306354e7c4",
+                    PREVIEW_MEMBERPASS_URL,
                 )
-                or "https://my.memberpass.net/306354e7c4"
+                or PREVIEW_MEMBERPASS_URL
             ),
             disable_notification=True,
         )
@@ -793,7 +802,13 @@ def preview_welcome_payload(store: Store) -> tuple[str, str | None]:
 def preview_welcome_version(store: Store) -> str:
     text, _ = preview_welcome_payload(store)
     mode = store.get_setting("preview_welcome_mode", "default") or "default"
-    link_version = store.get_setting("preview_memberpass_link_version", "v1") or "v1"
+    link_version = (
+        store.get_setting(
+            "preview_memberpass_link_version",
+            PREVIEW_MEMBERPASS_LINK_VERSION,
+        )
+        or PREVIEW_MEMBERPASS_LINK_VERSION
+    )
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     return f"{PREVIEW_WELCOME_COPY_VERSION}:{link_version}:{mode}:{digest}"
 
@@ -819,8 +834,8 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
         text=text,
         parse_mode=parse_mode,
         reply_markup=upgrade_keyboard(
-            store.get_setting("preview_memberpass_url", "https://my.memberpass.net/306354e7c4")
-            or "https://my.memberpass.net/306354e7c4"
+            store.get_setting("preview_memberpass_url", PREVIEW_MEMBERPASS_URL)
+            or PREVIEW_MEMBERPASS_URL
         ),
         disable_notification=True,
     )
@@ -844,6 +859,82 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
             )
     LOGGER.info("Published and pinned Mouth Preview welcome message")
     return message
+
+
+def _message_reply_markup_already_current(error: TelegramError) -> bool:
+    return "message is not modified" in str(error).lower()
+
+
+async def sync_preview_memberpass_links(application, store: Store) -> bool:
+    channel_id = store.get_setting("preview_channel_id")
+    if not channel_id:
+        return False
+
+    memberpass_url = (
+        store.get_setting("preview_memberpass_url", PREVIEW_MEMBERPASS_URL)
+        or PREVIEW_MEMBERPASS_URL
+    )
+    link_version = (
+        store.get_setting(
+            "preview_memberpass_link_version",
+            PREVIEW_MEMBERPASS_LINK_VERSION,
+        )
+        or PREVIEW_MEMBERPASS_LINK_VERSION
+    )
+    if store.get_setting("preview_memberpass_synced_version") == link_version:
+        return True
+
+    reply_markup = upgrade_keyboard(memberpass_url)
+    sync_succeeded = True
+    welcome_message_id = store.get_setting("preview_welcome_message_id")
+    if welcome_message_id:
+        try:
+            await application.bot.edit_message_reply_markup(
+                chat_id=channel_id,
+                message_id=int(welcome_message_id),
+                reply_markup=reply_markup,
+            )
+        except (TelegramError, ValueError) as exc:
+            if not isinstance(exc, TelegramError) or not _message_reply_markup_already_current(exc):
+                sync_succeeded = False
+                LOGGER.warning(
+                    "Could not update the Mouth Preview welcome MemberPass link",
+                    exc_info=True,
+                )
+        if sync_succeeded:
+            store.set_setting("preview_welcome_version", preview_welcome_version(store))
+    else:
+        try:
+            await ensure_preview_welcome(application, store, force=True)
+        except TelegramError:
+            sync_succeeded = False
+            LOGGER.warning(
+                "Could not publish the Mouth Preview welcome with the current MemberPass link",
+                exc_info=True,
+            )
+
+    for event in store.preview_recap_events_needing_link_sync(link_version):
+        try:
+            await application.bot.edit_message_reply_markup(
+                chat_id=channel_id,
+                message_id=event.message_id,
+                reply_markup=reply_markup,
+            )
+        except TelegramError as exc:
+            if not _message_reply_markup_already_current(exc):
+                sync_succeeded = False
+                LOGGER.warning(
+                    "Could not update the MemberPass link for Preview recap %s",
+                    event.event_key,
+                    exc_info=True,
+                )
+                continue
+        store.mark_preview_conversion_link_synced(event.id, link_version)
+
+    if sync_succeeded:
+        store.set_setting("preview_memberpass_synced_version", link_version)
+        LOGGER.info("Mouth Preview MemberPass links are synced to %s", link_version)
+    return sync_succeeded
 
 
 async def preview_dispatcher_job(context) -> None:
