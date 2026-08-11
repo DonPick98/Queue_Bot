@@ -141,8 +141,9 @@ def select_mosaic_candidates(
 def preview_creator_credit(item: MediaItem) -> str | None:
     source_id = str(item.source_id or "").strip().lower()
     caption = str(item.caption_html or "").strip()
-    if source_id.startswith("reddit:") and REDDIT_CREATOR_CREDIT_RE.fullmatch(caption):
-        return caption
+    creator_credit = caption.rsplit("\n", 1)[-1].strip()
+    if source_id.startswith("reddit:") and REDDIT_CREATOR_CREDIT_RE.fullmatch(creator_credit):
+        return creator_credit
     return None
 
 
