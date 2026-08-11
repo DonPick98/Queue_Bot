@@ -304,7 +304,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             store,
             1,
             source_id="reddit:r-example",
-            caption_html="u/Creator_Name-7",
+            caption_html="Caption visible only on the premium channel\nu/Creator_Name-7",
         )
         self.add_published(
             store,
