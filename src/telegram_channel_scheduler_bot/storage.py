@@ -890,6 +890,23 @@ class Store:
             ).fetchall()
         return [self._row_to_media_item(row) for row in rows]
 
+    def earliest_pending_preview_eligible_at(self, after: str | None = None) -> str | None:
+        query = """
+            SELECT MIN(preview_eligible_at) AS eligible_at
+            FROM media_items
+            WHERE status = ?
+              AND media_type = ?
+              AND preview_eligible_at IS NOT NULL
+              AND preview_published_at IS NULL
+        """
+        parameters: list[object] = [PUBLISHED, PHOTO]
+        if after is not None:
+            query += " AND preview_eligible_at > ?"
+            parameters.append(after)
+        with self.connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return str(row["eligible_at"]) if row and row["eligible_at"] else None
+
     def preview_history_between(self, start_at: str, end_at: str) -> list[MediaItem]:
         with self.connect() as connection:
             rows = connection.execute(
