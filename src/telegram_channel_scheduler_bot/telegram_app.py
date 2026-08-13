@@ -2210,11 +2210,14 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     advance_after_run = True
     outcomes: list[PublishOutcome] = []
     scheduled_for = parse_datetime_setting(store.get_setting("next_publish_at"))
+    store.set_setting("premium_last_check_at", datetime_to_setting(utcnow()))
     try:
         now = utcnow()
         if not is_within_posting_windows(now, get_timezone_name(store), get_posting_windows(store)):
             next_publish_at = next_allowed_datetime(now, get_timezone_name(store), get_posting_windows(store))
             store.set_setting("next_publish_at", datetime_to_setting(next_publish_at))
+            store.set_setting("premium_last_status", "waiting_window")
+            store.set_setting("premium_last_error", "")
             LOGGER.info("Outside posting window; next publish scheduled at %s", datetime_to_setting(next_publish_at))
             advance_after_run = False
             return
@@ -2227,7 +2230,13 @@ async def publisher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         if outcomes and outcomes[0].status not in {"empty", "paused"}:
             LOGGER.info(format_publish_outcomes(outcomes))
+        store.set_setting("premium_last_status", outcomes[0].status if outcomes else "checked")
+        store.set_setting("premium_last_error", "")
         await check_queue_coverage_alert(context.application, notify=True)
+    except Exception as exc:
+        store.set_setting("premium_last_status", "error")
+        store.set_setting("premium_last_error", str(exc)[:1000])
+        raise
     finally:
         if advance_after_run:
             next_publish_at = set_next_publish_after_interval(store, scheduled_for=scheduled_for)
