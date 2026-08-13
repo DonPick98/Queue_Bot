@@ -15,13 +15,18 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from .config import PREVIEW_MEMBERPASS_LINK_VERSION, PREVIEW_MEMBERPASS_URL
+from .preview_schedule import (
+    PREVIEW_JOB_INTERVAL_SECONDS,
+    PREVIEW_MAX_POSTS_PER_DAY,
+    due_preview_slots,
+    local_day_bounds,
+    parse_preview_times,
+)
 from .storage import MediaItem, PreviewConversionEvent, Store
 
 
 LOGGER = logging.getLogger(__name__)
 PREVIEW_JOB_NAME = "mouth_preview_dispatcher"
-PREVIEW_JOB_INTERVAL_SECONDS = 300
-PREVIEW_MAX_POSTS_PER_DAY = 2
 PREVIEW_MOSAIC_MIN = 9
 PREVIEW_MOSAIC_LIMIT = 12
 PREVIEW_MOSAIC_CANDIDATE_LIMIT = 48
@@ -35,39 +40,6 @@ REDDIT_CREATOR_CREDIT_RE = re.compile(r"u/[A-Za-z0-9_-]{3,20}")
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def parse_preview_times(raw: str) -> tuple[time, ...]:
-    values: list[time] = []
-    for chunk in raw.replace(";", ",").split(","):
-        value = chunk.strip()
-        if not value:
-            continue
-        match = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
-        if not match:
-            raise ValueError(f"Orario Preview non valido: {value!r}")
-        hour, minute = int(match.group(1)), int(match.group(2))
-        if hour > 23 or minute > 59:
-            raise ValueError(f"Orario Preview non valido: {value!r}")
-        candidate = time(hour, minute)
-        if candidate not in values:
-            values.append(candidate)
-    if not values:
-        raise ValueError("PREVIEW_POSTING_TIMES deve contenere almeno un orario HH:MM")
-    return tuple(sorted(values))
-
-
-def local_day_bounds(value: datetime, timezone_name: str) -> tuple[datetime, datetime, str]:
-    zone = ZoneInfo(timezone_name)
-    local = value.astimezone(zone)
-    start_local = datetime.combine(local.date(), time.min, tzinfo=zone)
-    end_local = start_local + timedelta(days=1)
-    return start_local.astimezone(UTC), end_local.astimezone(UTC), local.date().isoformat()
-
-
-def due_preview_slots(value: datetime, timezone_name: str, posting_times: str) -> int:
-    local_time = value.astimezone(ZoneInfo(timezone_name)).time().replace(tzinfo=None)
-    return sum(slot <= local_time for slot in parse_preview_times(posting_times))
 
 
 def source_key(item: MediaItem) -> str:
@@ -940,14 +912,22 @@ async def sync_preview_memberpass_links(application, store: Store) -> bool:
 
 async def preview_dispatcher_job(context) -> None:
     store: Store = context.application.bot_data["store"]
+    checked_at = utcnow().isoformat(timespec="seconds")
+    store.set_setting("preview_last_check_at", checked_at)
     if not store.get_setting("preview_channel_id"):
+        store.set_setting("preview_last_status", "not_configured")
+        store.set_setting("preview_last_error", "")
         return
     try:
         await ensure_preview_welcome(context.application, store)
-        await PreviewPublisher(store).publish_due(context.application)
+        sent_count = await PreviewPublisher(store).publish_due(context.application)
         WeeklyPreviewRecap(store).ensure_event()
         await PreviewConversionScheduler(store).send_pending(context.application)
-    except Exception:
+        store.set_setting("preview_last_status", "published" if sent_count else "checked")
+        store.set_setting("preview_last_error", "")
+    except Exception as exc:
+        store.set_setting("preview_last_status", "error")
+        store.set_setting("preview_last_error", str(exc)[:1000])
         LOGGER.exception("Mouth Preview dispatcher failed")
 
 
