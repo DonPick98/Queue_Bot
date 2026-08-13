@@ -17,6 +17,7 @@ except ModuleNotFoundError:
     cgi = None
 
 from .balancer import PHOTO, VIDEO
+from .channel_status import build_channel_status
 from .storage import Store
 
 
@@ -168,7 +169,18 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         remember_public_base_url(self.store, self.headers)
-        if self.path not in {"/", "/healthz"}:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/channels/status":
+            if self.store is None:
+                _json_response(self, 503, {"ok": False, "error": "queue_api_not_ready"})
+                return
+            try:
+                _json_response(self, 200, build_channel_status(self.store))
+            except Exception as exc:
+                LOGGER.exception("Channel status endpoint failed")
+                _json_response(self, 500, {"ok": False, "error": str(exc)})
+            return
+        if parsed.path not in {"/", "/healthz"}:
             self.send_response(404)
             self.end_headers()
             return
