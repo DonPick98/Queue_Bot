@@ -1,4 +1,5 @@
 from contextlib import suppress
+import asyncio
 from datetime import UTC, datetime, timedelta
 from http.server import ThreadingHTTPServer
 import json
@@ -9,7 +10,7 @@ import urllib.request
 from uuid import uuid4
 
 from telegram_channel_scheduler_bot.channel_status import build_channel_status
-from telegram_channel_scheduler_bot.health import HealthHandler
+from telegram_channel_scheduler_bot.health import HealthHandler, configure_manual_publish
 from telegram_channel_scheduler_bot.storage import Store
 
 
@@ -124,6 +125,46 @@ class ChannelStatusTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["premium"]["channel_id"], "@premium")
         self.assertEqual(payload["preview"]["channel_id"], "@mouthpreview")
+
+    def test_health_server_runs_manual_publish_on_the_bot_event_loop(self) -> None:
+        calls: list[str] = []
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+
+        async def publish(channel: str) -> dict[str, object]:
+            calls.append(channel)
+            return {
+                "ok": True,
+                "status": "published",
+                "message": "extra published",
+                "schedule_unchanged": True,
+            }
+
+        configure_manual_publish(loop, publish)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/channels/preview/publish",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server_thread.join(2)
+            server.server_close()
+            configure_manual_publish(None, None)
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(2)
+            loop.close()
+
+        self.assertEqual(calls, ["preview"])
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["schedule_unchanged"])
 
 
 if __name__ == "__main__":
