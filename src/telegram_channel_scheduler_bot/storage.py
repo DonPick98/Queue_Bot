@@ -62,6 +62,7 @@ class MediaItem:
     preview_thumbnail_file_id: str | None = None
     preview_eligible_at: str | None = None
     preview_published_at: str | None = None
+    preview_publish_source: str | None = None
     preview_message_id: int | None = None
     preview_variant: str | None = None
     preview_memberpass_link_version: str | None = None
@@ -240,6 +241,7 @@ class Store:
             self._ensure_column(connection, "media_items", "preview_thumbnail_file_id TEXT")
             self._ensure_column(connection, "media_items", "preview_eligible_at TEXT")
             self._ensure_column(connection, "media_items", "preview_published_at TEXT")
+            self._ensure_column(connection, "media_items", "preview_publish_source TEXT")
             self._ensure_column(connection, "media_items", "preview_message_id INTEGER")
             self._ensure_column(connection, "media_items", "preview_variant TEXT")
             self._ensure_column(connection, "media_items", "preview_memberpass_link_version TEXT")
@@ -1013,6 +1015,7 @@ class Store:
         published_at: str | None = None,
         variant: str = "full_photo",
         memberpass_link_version: str | None = None,
+        publish_source: str = "scheduled",
     ) -> None:
         link_version = memberpass_link_version or self.get_setting(
             "preview_memberpass_link_version",
@@ -1023,12 +1026,20 @@ class Store:
                 """
                 UPDATE media_items
                 SET preview_published_at = ?, preview_message_id = ?, preview_variant = ?,
-                    preview_memberpass_link_version = ?, preview_error = NULL
+                    preview_memberpass_link_version = ?, preview_publish_source = ?,
+                    preview_error = NULL
                 WHERE id = ? AND preview_published_at IS NULL
                 """,
-                (published_at or utcnow_iso(), message_id, variant, link_version, media_item_id),
-
+                (
+                    published_at or utcnow_iso(),
+                    message_id,
+                    variant,
+                    link_version,
+                    publish_source,
+                    media_item_id,
+                ),
             )
+
     def mark_preview_failed(self, media_item_id: int, error: str) -> None:
         with self.connect() as connection:
             connection.execute(
@@ -1054,6 +1065,18 @@ class Store:
                 """
                 SELECT COUNT(*) AS count FROM media_items
                 WHERE preview_published_at >= ? AND preview_published_at < ?
+                """,
+                (start_at, end_at),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def scheduled_preview_count_between(self, start_at: str, end_at: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM media_items
+                WHERE preview_published_at >= ? AND preview_published_at < ?
+                  AND COALESCE(preview_publish_source, 'scheduled') = 'scheduled'
                 """,
                 (start_at, end_at),
             ).fetchone()
@@ -1471,6 +1494,11 @@ class Store:
             ),
             preview_eligible_at=(row["preview_eligible_at"] if "preview_eligible_at" in row.keys() else None),
             preview_published_at=(row["preview_published_at"] if "preview_published_at" in row.keys() else None),
+            preview_publish_source=(
+                row["preview_publish_source"]
+                if "preview_publish_source" in row.keys()
+                else None
+            ),
             preview_message_id=optional_int(row, "preview_message_id"),
             preview_variant=(row["preview_variant"] if "preview_variant" in row.keys() else None),
             preview_memberpass_link_version=(

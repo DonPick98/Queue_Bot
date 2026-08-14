@@ -30,7 +30,12 @@ from telegram.ext import (
 
 from .balancer import PHOTO, VIDEO, choose_media_type
 from .config import AppConfig
-from .health import PUBLIC_URL_SETTING, normalize_public_base_url, start_http_server_from_env
+from .health import (
+    PUBLIC_URL_SETTING,
+    configure_manual_publish,
+    normalize_public_base_url,
+    start_http_server_from_env,
+)
 from .notifications import scheduled_posts_per_day
 from .posting_plan import (
     QUEUE_ALERT_HOURS,
@@ -49,6 +54,7 @@ from .preview import (
     set_preview_welcome,
     sync_preview_memberpass_links,
 )
+from .publish_lock import channel_publish_lock
 from .queue_order import parse_queue_order
 from .scheduling import (
     DEFAULT_TIMEZONE,
@@ -1609,6 +1615,56 @@ async def post_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await check_queue_coverage_alert(context.application, notify=True)
 
 
+async def publish_channel_manually(application: Application, channel: str) -> dict[str, object]:
+    store = get_store(application)
+    if channel == "premium":
+        scheduled_next_at = store.get_setting("next_publish_at")
+        outcome = await publish_next(application, manual=True)
+        if outcome.status == "published":
+            try:
+                await create_backup_after_publish(application)
+            except Exception:
+                LOGGER.exception("Post-publish backup failed after Dashboard manual publish")
+            await check_queue_coverage_alert(application, notify=True)
+        return {
+            "ok": outcome.status == "published",
+            "status": outcome.status,
+            "message": outcome.message,
+            "media_id": outcome.media_item.id if outcome.media_item else None,
+            "media_type": outcome.media_item.media_type if outcome.media_item else None,
+            "scheduled_next_at": scheduled_next_at,
+            "schedule_unchanged": store.get_setting("next_publish_at") == scheduled_next_at,
+        }
+
+    if channel == "preview":
+        posting_times = store.get_setting("preview_posting_times", "10:00,20:00") or "10:00,20:00"
+        item = await PreviewPublisher(store).publish_one_now(application)
+        if item is None:
+            return {
+                "ok": False,
+                "status": "empty",
+                "message": "Non ci sono foto idonee e diverse da pubblicare ora.",
+                "posting_times": posting_times,
+                "schedule_unchanged": True,
+            }
+        return {
+            "ok": True,
+            "status": "published",
+            "message": f"Foto #{item.id} pubblicata su MouthPreview come extra.",
+            "media_id": item.id,
+            "media_type": item.media_type,
+            "posting_times": posting_times,
+            "schedule_unchanged": store.get_setting("preview_posting_times", "10:00,20:00") == posting_times,
+        }
+
+    return {
+        "ok": False,
+        "status": "invalid_channel",
+        "message": "Canale non valido.",
+        "schedule_unchanged": True,
+    }
+
+
 async def post_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update, context):
         return
@@ -1981,6 +2037,11 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def publish_next(application: Application, manual: bool = False) -> PublishOutcome:
+    async with channel_publish_lock(application, "premium"):
+        return await _publish_next_unlocked(application, manual=manual)
+
+
+async def _publish_next_unlocked(application: Application, manual: bool = False) -> PublishOutcome:
     store = get_store(application)
 
     if store.get_bool_setting("paused") and not manual:
@@ -2334,6 +2395,10 @@ async def configure_bot_commands(application: Application) -> None:
 
 
 async def initialize_bot(application: Application) -> None:
+    configure_manual_publish(
+        asyncio.get_running_loop(),
+        lambda channel: publish_channel_manually(application, channel),
+    )
     await configure_bot_commands(application)
     try:
         await sync_preview_memberpass_links(application, application.bot_data["store"])

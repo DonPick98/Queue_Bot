@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
+import concurrent.futures
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -23,6 +26,11 @@ from .storage import Store
 
 LOGGER = logging.getLogger(__name__)
 PUBLIC_URL_SETTING = "last_public_base_url"
+MANUAL_PUBLISH_PATHS = {
+    "/api/channels/premium/publish": "premium",
+    "/api/channels/preview/publish": "preview",
+}
+ManualPublishHandler = Callable[[str], Awaitable[dict[str, object]]]
 
 
 def _clean_forwarded_value(value: str | None) -> str:
@@ -166,6 +174,12 @@ class HealthHandler(BaseHTTPRequestHandler):
     server_version = "MouthQueueHealth/1.0"
     store: Store | None = None
     bot_token: str | None = None
+    event_loop: asyncio.AbstractEventLoop | None = None
+    manual_publish_handler: ManualPublishHandler | None = None
+    manual_publish_locks = {
+        "premium": threading.Lock(),
+        "preview": threading.Lock(),
+    }
 
     def do_GET(self) -> None:
         remember_public_base_url(self.store, self.headers)
@@ -195,6 +209,10 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         remember_public_base_url(self.store, self.headers)
         parsed = urllib.parse.urlparse(self.path)
+        manual_channel = MANUAL_PUBLISH_PATHS.get(parsed.path)
+        if manual_channel:
+            self._manual_publish(manual_channel)
+            return
         if parsed.path not in {"/api/queue/photo", "/api/queue/video"}:
             _json_response(self, 404, {"ok": False, "error": "not_found"})
             return
@@ -229,6 +247,36 @@ class HealthHandler(BaseHTTPRequestHandler):
         media_type = PHOTO if parsed.path.endswith("/photo") else VIDEO
         result = self._queue_upload(media_type)
         _json_response(self, result[0], result[1])
+
+    def _manual_publish(self, channel: str) -> None:
+        loop = type(self).event_loop
+        handler = type(self).manual_publish_handler
+        if loop is None or handler is None or not loop.is_running():
+            _json_response(self, 503, {"ok": False, "error": "manual_publish_not_ready"})
+            return
+
+        lock = type(self).manual_publish_locks[channel]
+        if not lock.acquire(blocking=False):
+            _json_response(self, 409, {"ok": False, "error": "publish_in_progress"})
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(handler(channel), loop)
+            try:
+                payload = future.result(timeout=180)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                _json_response(self, 504, {"ok": False, "error": "publish_timeout"})
+                return
+            except Exception as exc:
+                LOGGER.exception("Manual %s publish failed", channel)
+                _json_response(self, 500, {"ok": False, "error": str(exc)})
+                return
+
+            status = 200 if payload.get("ok") else 409
+            _json_response(self, status, dict(payload))
+        finally:
+            lock.release()
 
     def _queue_upload(self, media_type: str) -> tuple[int, dict[str, Any]]:
         assert self.store is not None
@@ -375,3 +423,11 @@ def start_http_server_from_env(store: Store | None = None, bot_token: str | None
 
 
 start_health_server_from_env = start_http_server_from_env
+
+
+def configure_manual_publish(
+    event_loop: asyncio.AbstractEventLoop | None,
+    handler: ManualPublishHandler | None,
+) -> None:
+    HealthHandler.event_loop = event_loop
+    HealthHandler.manual_publish_handler = handler

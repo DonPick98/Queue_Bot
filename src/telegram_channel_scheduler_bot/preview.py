@@ -22,6 +22,7 @@ from .preview_schedule import (
     local_day_bounds,
     parse_preview_times,
 )
+from .publish_lock import channel_publish_lock
 from .storage import MediaItem, PreviewConversionEvent, Store
 
 
@@ -142,13 +143,14 @@ class PreviewSelector:
         if not allowed:
             return None
 
-        def score(item: MediaItem) -> tuple[int, int, int, int, int, int]:
+        def score(item: MediaItem) -> tuple[int, int, int, int, int, int, int]:
             tags = set(item.derived_tags)
             aspect, resolution = technical_quality(item)
             return (
                 1 if source_key(item) != last_source else 0,
                 1 if not last_tags or not tags or not (tags & last_tags) else 0,
                 1 if not last_visual_hash or item.visual_hash != last_visual_hash else 0,
+                -item.preview_failed_attempts,
                 aspect,
                 resolution,
                 -item.id,
@@ -461,6 +463,10 @@ class PreviewPublisher:
     selector: PreviewSelector = field(default_factory=PreviewSelector)
 
     async def publish_due(self, application, now: datetime | None = None) -> int:
+        async with channel_publish_lock(application, "preview"):
+            return await self._publish_due_unlocked(application, now=now)
+
+    async def _publish_due_unlocked(self, application, now: datetime | None = None) -> int:
         channel_id = self.store.get_setting("preview_channel_id")
         if not channel_id:
             return 0
@@ -468,6 +474,7 @@ class PreviewPublisher:
         timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
         start, end, local_date = local_day_bounds(now, timezone_name)
         history = self.store.preview_history_between(start.isoformat(), end.isoformat())
+        scheduled_today = self.store.scheduled_preview_count_between(start.isoformat(), end.isoformat())
         configured_limit = self.store.get_int_setting("preview_posts_per_day", 2)
         daily_limit = min(PREVIEW_MAX_POSTS_PER_DAY, max(1, configured_limit))
         due = min(
@@ -478,10 +485,15 @@ class PreviewPublisher:
                 self.store.get_setting("preview_posting_times", "10:00,20:00") or "10:00,20:00",
             ),
         )
-        missing = max(0, due - len(history))
+        missing = max(0, due - scheduled_today)
         sent_count = 0
-        for _ in range(missing):
-            candidates = self.store.list_preview_candidates(now.isoformat())
+        failed_ids: set[int] = set()
+        while sent_count < missing:
+            candidates = [
+                item
+                for item in self.store.list_preview_candidates(now.isoformat())
+                if item.id not in failed_ids
+            ]
             item = self.selector.choose(candidates, history, self.store.latest_preview_item())
             if item is None:
                 LOGGER.info("No diverse eligible photo available for Mouth Preview")
@@ -498,9 +510,10 @@ class PreviewPublisher:
                 )
             except (TelegramError, OSError, ValueError) as exc:
                 self.store.mark_preview_failed(item.id, str(exc))
+                failed_ids.add(item.id)
                 LOGGER.warning("Mouth Preview photo %s failed", item.id, exc_info=True)
-                break
-            published_at = utcnow().isoformat(timespec="seconds")
+                continue
+            published_at = now.isoformat(timespec="seconds")
             self.store.mark_preview_published(item.id, sent.message_id, published_at)
             history.append(self.store.find_media_by_id(item.id) or item)
             sent_count += 1
@@ -519,12 +532,25 @@ class PreviewPublisher:
         now: datetime | None = None,
         staging_chat_id: int | str | None = None,
     ) -> MediaItem | None:
+        async with channel_publish_lock(application, "preview"):
+            return await self._publish_one_now_unlocked(
+                application,
+                now=now,
+                staging_chat_id=staging_chat_id,
+            )
+
+    async def _publish_one_now_unlocked(
+        self,
+        application,
+        now: datetime | None = None,
+        staging_chat_id: int | str | None = None,
+    ) -> MediaItem | None:
         channel_id = self.store.get_setting("preview_channel_id")
         if not channel_id:
             raise ValueError("Configura prima il canale Mouth Preview.")
         now = now or utcnow()
         timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
-        start, end, local_date = local_day_bounds(now, timezone_name)
+        start, end, _ = local_day_bounds(now, timezone_name)
         history = self.store.preview_history_between(start.isoformat(), end.isoformat())
         item = self.selector.choose(
             self.store.list_preview_candidates(now.isoformat()),
@@ -533,7 +559,6 @@ class PreviewPublisher:
         )
         if item is None:
             return None
-        policy = self.store.get_or_assign_preview_notification_policy(item.id, local_date)
         try:
             photo = await prepare_preview_photo(
                 application,
@@ -545,14 +570,19 @@ class PreviewPublisher:
             sent = await application.bot.send_photo(
                 chat_id=channel_id,
                 photo=photo,
-                disable_notification=policy.silent,
+                disable_notification=False,
                 **({"caption": creator_credit} if creator_credit else {}),
             )
         except (TelegramError, OSError, ValueError) as exc:
             self.store.mark_preview_failed(item.id, str(exc))
             raise
-        published_at = utcnow().isoformat(timespec="seconds")
-        self.store.mark_preview_published(item.id, sent.message_id, published_at)
+        published_at = now.isoformat(timespec="seconds")
+        self.store.mark_preview_published(
+            item.id,
+            sent.message_id,
+            published_at,
+            publish_source="manual",
+        )
         LOGGER.info("Manually published Mouth Preview photo %s", item.id)
         return self.store.find_media_by_id(item.id) or item
 
@@ -918,17 +948,36 @@ async def preview_dispatcher_job(context) -> None:
         store.set_setting("preview_last_status", "not_configured")
         store.set_setting("preview_last_error", "")
         return
+
+    warnings: list[str] = []
+    publish_error = ""
+    sent_count = 0
     try:
         await ensure_preview_welcome(context.application, store)
+    except Exception as exc:
+        warnings.append(f"Messaggio fissato: {exc}")
+        LOGGER.exception("Mouth Preview welcome maintenance failed")
+
+    store.set_setting("preview_last_publish_attempt_at", checked_at)
+    try:
         sent_count = await PreviewPublisher(store).publish_due(context.application)
+    except Exception as exc:
+        publish_error = str(exc)[:1000]
+        LOGGER.exception("Mouth Preview publishing failed")
+
+    try:
         WeeklyPreviewRecap(store).ensure_event()
         await PreviewConversionScheduler(store).send_pending(context.application)
-        store.set_setting("preview_last_status", "published" if sent_count else "checked")
-        store.set_setting("preview_last_error", "")
     except Exception as exc:
-        store.set_setting("preview_last_status", "error")
-        store.set_setting("preview_last_error", str(exc)[:1000])
-        LOGGER.exception("Mouth Preview dispatcher failed")
+        warnings.append(f"Recap: {exc}")
+        LOGGER.exception("Mouth Preview recap maintenance failed")
+
+    store.set_setting(
+        "preview_last_status",
+        "error" if publish_error else "published" if sent_count else "checked",
+    )
+    store.set_setting("preview_last_error", publish_error)
+    store.set_setting("preview_last_warning", "; ".join(warnings)[:1000])
 
 
 def schedule_preview(application, store: Store) -> None:

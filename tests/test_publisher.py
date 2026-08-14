@@ -6,7 +6,11 @@ from uuid import uuid4
 from telegram.error import TelegramError
 
 from telegram_channel_scheduler_bot.storage import FAILED, PUBLISHED, QUEUED, Store
-from telegram_channel_scheduler_bot.telegram_app import publish_many, publish_next
+from telegram_channel_scheduler_bot.telegram_app import (
+    publish_channel_manually,
+    publish_many,
+    publish_next,
+)
 
 
 class FakeBot:
@@ -207,6 +211,21 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, "published")
         self.assertEqual(app.bot.notification_attempts, [("manual-video", None)])
+
+    async def test_dashboard_premium_publish_is_extra_and_keeps_next_schedule(self):
+        store = self.make_store()
+        store.set_setting("backup_after_publish_enabled", "false")
+        scheduled_next_at = "2026-08-15T08:30:00+00:00"
+        store.set_setting("next_publish_at", scheduled_next_at)
+        store.add_media("photo", "manual-photo", "manual-extra-unique", None, 123)
+        app = SimpleNamespace(bot=FakeBot(), bot_data={"store": store})
+
+        payload = await publish_channel_manually(app, "premium")
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["schedule_unchanged"])
+        self.assertEqual(store.get_setting("next_publish_at"), scheduled_next_at)
+        self.assertEqual(app.bot.photos, ["manual-photo"])
 
 
 if __name__ == "__main__":

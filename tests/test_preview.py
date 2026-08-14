@@ -3,6 +3,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from PIL import Image
@@ -17,11 +18,13 @@ from telegram_channel_scheduler_bot.preview import (
     build_watermarked_photo,
     prepare_preview_photo,
     preview_welcome_version,
+    preview_dispatcher_job,
     set_preview_welcome,
     sync_preview_memberpass_links,
     build_mosaic,
     due_preview_slots,
     ensure_preview_welcome,
+    local_day_bounds,
     recap_text,
     select_mosaic_candidates,
     upgrade_text,
@@ -343,6 +346,33 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.preview_variant, "full_photo")
         self.assertEqual(retried.preview_memberpass_link_version, "v1")
 
+    async def test_broken_photo_does_not_block_other_due_preview_posts(self):
+        store = self.make_store()
+        broken = self.add_published(store, 1)
+        second = self.add_published(store, 2)
+        third = self.add_published(store, 3)
+        bot = FakePreviewBot()
+        bot.unavailable_file_ids.add(broken.file_id)
+        app = SimpleNamespace(bot=bot)
+
+        count = await PreviewPublisher(store).publish_due(
+            app,
+            datetime(2026, 7, 13, 19, 0, tzinfo=UTC),
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            {item.id for item in (second, third)},
+            {
+                item.id
+                for item in store.preview_history_between(
+                    "2026-07-13T00:00:00+00:00",
+                    "2026-07-14T23:59:59+00:00",
+                )
+            },
+        )
+        self.assertEqual(store.find_media_by_id(broken.id).preview_failed_attempts, 1)
+
     def test_selector_never_reuses_a_source_on_same_day(self):
         store = self.make_store()
         first = self.add_published(store, 1, source_id="same")
@@ -517,7 +547,53 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(published.id, item.id)
         self.assertEqual(len(bot.photos), 1)
-        self.assertIsNotNone(store.find_media_by_id(item.id).preview_published_at)
+        stored = store.find_media_by_id(item.id)
+        self.assertIsNotNone(stored.preview_published_at)
+        self.assertEqual(stored.preview_publish_source, "manual")
+        self.assertFalse(bot.photos[0]["disable_notification"])
+
+    async def test_manual_preview_is_extra_and_does_not_consume_scheduled_slots(self):
+        store = self.make_store()
+        self.add_published(store, 1)
+        self.add_published(store, 2)
+        self.add_published(store, 3)
+        bot = FakePreviewBot()
+        app = SimpleNamespace(bot=bot)
+        now = datetime(2026, 7, 13, 19, 0, tzinfo=UTC)
+
+        manual_item = await PreviewPublisher(store).publish_one_now(app, now)
+        scheduled_count = await PreviewPublisher(store).publish_due(app, now)
+        start, end, _ = local_day_bounds(now, "Europe/Rome")
+
+        self.assertIsNotNone(manual_item)
+        self.assertEqual(scheduled_count, 2)
+        self.assertEqual(store.preview_count_between(start.isoformat(), end.isoformat()), 3)
+        self.assertEqual(store.scheduled_preview_count_between(start.isoformat(), end.isoformat()), 2)
+
+    async def test_welcome_maintenance_failure_does_not_block_preview_publishing(self):
+        store = self.make_store()
+        application = SimpleNamespace(bot_data={"store": store}, bot=FakePreviewBot())
+        context = SimpleNamespace(application=application)
+
+        with (
+            patch(
+                "telegram_channel_scheduler_bot.preview.ensure_preview_welcome",
+                new=AsyncMock(side_effect=TelegramError("pin unavailable")),
+            ),
+            patch.object(PreviewPublisher, "publish_due", new=AsyncMock(return_value=1)) as publish_due,
+            patch.object(WeeklyPreviewRecap, "ensure_event", return_value=None),
+            patch.object(
+                PreviewConversionScheduler,
+                "send_pending",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            await preview_dispatcher_job(context)
+
+        publish_due.assert_awaited_once_with(application)
+        self.assertEqual(store.get_setting("preview_last_status"), "published")
+        self.assertEqual(store.get_setting("preview_last_error"), "")
+        self.assertIn("pin unavailable", store.get_setting("preview_last_warning"))
     async def test_custom_welcome_is_plain_text_with_memberpass_button(self):
         store = self.make_store()
         set_preview_welcome(store, "custom", "Custom <b>plain</b> welcome")
