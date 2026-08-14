@@ -53,14 +53,14 @@ def _next_preview_opportunity(
     eligible_at: datetime,
     zone: ZoneInfo,
     posting_times: tuple[time, ...],
-    published_today: int,
+    scheduled_today: int,
     daily_limit: int,
 ) -> datetime:
     candidate = max(now, eligible_at).astimezone(zone)
     today = now.astimezone(zone).date()
     for day_offset in range(8):
         day = candidate.date() + timedelta(days=day_offset)
-        existing = published_today if day == today else 0
+        existing = scheduled_today if day == today else 0
         if existing >= daily_limit:
             continue
         earliest = candidate if day_offset == 0 else datetime.combine(day, time.min, tzinfo=zone)
@@ -95,7 +95,8 @@ def _source_key(item) -> str:
 
 def _selectable_candidate(eligible, history):
     used_sources = {_source_key(item) for item in history}
-    return next((item for item in eligible if _source_key(item) not in used_sources), None)
+    allowed = [item for item in eligible if _source_key(item) not in used_sources]
+    return min(allowed, key=lambda item: (item.preview_failed_attempts, item.id), default=None)
 
 
 def _premium_status(store: Store, now: datetime, timezone_name: str, zone: ZoneInfo) -> dict[str, Any]:
@@ -163,6 +164,8 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
     start, end, _ = local_day_bounds(now, timezone_name)
     history = store.preview_history_between(start.isoformat(), end.isoformat())
     published_today = len(history)
+    scheduled_today = store.scheduled_preview_count_between(start.isoformat(), end.isoformat())
+    manual_today = max(0, published_today - scheduled_today)
     daily_limit = min(
         PREVIEW_MAX_POSTS_PER_DAY,
         max(1, store.get_int_setting("preview_posts_per_day", PREVIEW_MAX_POSTS_PER_DAY)),
@@ -174,7 +177,7 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
         posting_times_raw = "10:00,20:00"
         posting_times = parse_preview_times(posting_times_raw)
     due_slots = min(daily_limit, due_preview_slots(now, timezone_name, posting_times_raw))
-    missing_due = max(0, due_slots - published_today)
+    missing_due = max(0, due_slots - scheduled_today)
     now_iso = now.isoformat(timespec="seconds")
     eligible = store.list_preview_candidates(now_iso)
     selected = _selectable_candidate(eligible, history)
@@ -194,7 +197,7 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
                 eligible_reference,
                 zone,
                 posting_times,
-                published_today,
+                scheduled_today,
                 daily_limit,
             )
 
@@ -216,7 +219,7 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
         status, reason = "waiting", f"Nessuna foto ancora idonea dopo il ritardo di {delay} ore"
     elif missing_due:
         status, reason = "empty", "Nessuna foto Premium in attesa per Preview"
-    elif published_today >= daily_limit:
+    elif scheduled_today >= daily_limit:
         status, reason = "complete", "Quota giornaliera completata"
     elif earliest_pending is None:
         status, reason = "empty", "Nessuna foto Premium in attesa per Preview"
@@ -236,7 +239,11 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
         "last_post_at": _iso(last_post_at),
         "last_post_local": _local_iso(last_post_at, zone),
         "last_check_at": _iso(last_check_at),
+        "last_publish_attempt_at": store.get_setting("preview_last_publish_attempt_at"),
+        "warning": store.get_setting("preview_last_warning") or None,
         "published_today": published_today,
+        "scheduled_today": scheduled_today,
+        "manual_today": manual_today,
         "daily_limit": daily_limit,
         "due_slots": due_slots,
         "missing_due": missing_due,
