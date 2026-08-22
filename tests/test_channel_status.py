@@ -39,7 +39,7 @@ class ChannelStatusTests(unittest.TestCase):
         with suppress(OSError):
             path.unlink(missing_ok=True)
 
-    def add_published_photo(self, store: Store, eligible_at: datetime) -> None:
+    def add_published_photo(self, store: Store, eligible_at: datetime):
         result = store.add_media("photo", "photo-file", "photo-unique", None, 1, source_id="reddit:one")
         item = result.media_item
         store.mark_published(item.file_unique_id, "photo", source="bot", media_item_id=item.id)
@@ -48,6 +48,7 @@ class ChannelStatusTests(unittest.TestCase):
                 "UPDATE media_items SET preview_eligible_at = ? WHERE id = ?",
                 (eligible_at.isoformat(timespec="seconds"), item.id),
             )
+        return item
 
     def test_reports_premium_and_due_preview_separately(self) -> None:
         store = self.make_store()
@@ -92,6 +93,23 @@ class ChannelStatusTests(unittest.TestCase):
 
         self.assertEqual(preview["status"], "error")
         self.assertIn("11 minuti", preview["reason"])
+
+    def test_preview_surfaces_candidate_error_before_next_slot_when_stalled(self) -> None:
+        store = self.make_store()
+        now = datetime(2026, 8, 22, 7, 39, tzinfo=UTC)
+        store.set_setting("next_publish_at", (now + timedelta(minutes=21)).isoformat())
+        store.set_setting("preview_last_check_at", now.isoformat())
+        item = self.add_published_photo(store, now - timedelta(hours=1))
+        store.mark_preview_failed(
+            item.id,
+            "Message has protected content and can't be forwarded",
+        )
+
+        preview = build_channel_status(store, now=now)["preview"]
+
+        self.assertEqual(preview["status"], "error")
+        self.assertIn("protected content", preview["reason"])
+        self.assertEqual(preview["next_post_at"], datetime(2026, 8, 22, 8, 0, tzinfo=UTC).isoformat())
 
     def test_unconfigured_channels_do_not_claim_a_next_post(self) -> None:
         store = self.make_store()
