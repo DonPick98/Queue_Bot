@@ -185,6 +185,13 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
     earliest_future = _parse_datetime(store.earliest_pending_preview_eligible_at(after=now_iso))
     last_check_at = _parse_datetime(store.get_setting("preview_last_check_at"))
     last_dispatcher_error = store.get_setting("preview_last_error") or None
+    last_item = store.latest_preview_item()
+    last_post_at = _parse_datetime(last_item.preview_published_at if last_item else None)
+    stalled_with_candidate_error = (
+        selected is not None
+        and bool(selected.preview_error)
+        and (last_post_at is None or now - last_post_at > timedelta(hours=30))
+    )
 
     next_post_at: datetime | None = None
     if earliest_pending is not None:
@@ -208,6 +215,8 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
         status, reason = "error", last_dispatcher_error
     elif last_check_at and now - last_check_at > timedelta(seconds=PREVIEW_JOB_INTERVAL_SECONDS * 2 + 60):
         status, reason = "error", "Il controllo Preview non viene eseguito da oltre 11 minuti"
+    elif stalled_with_candidate_error:
+        status, reason = "error", selected.preview_error
     elif missing_due and selected is not None and selected.preview_error:
         status, reason = "error", selected.preview_error
     elif missing_due and selected is not None:
@@ -226,8 +235,6 @@ def _preview_status(store: Store, now: datetime, timezone_name: str, zone: ZoneI
     else:
         status, reason = "scheduled", "In attesa del prossimo orario Preview"
 
-    last_item = store.latest_preview_item()
-    last_post_at = _parse_datetime(last_item.preview_published_at if last_item else None)
     return {
         "label": "MouthPreview",
         "channel_id": channel_id,

@@ -8,6 +8,8 @@ import hashlib
 import logging
 import re
 from typing import Iterable
+import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
@@ -33,6 +35,7 @@ PREVIEW_MOSAIC_LIMIT = 12
 PREVIEW_MOSAIC_CANDIDATE_LIMIT = 48
 PREVIEW_MOSAIC_DOWNLOAD_BATCH = 4
 PREVIEW_WATERMARK_MAX_DIMENSION = 2560
+PREVIEW_SOURCE_MAX_BYTES = 20 * 1024 * 1024
 PREMIUM_CHANNEL_NAME = "Mouth Aesthethics"
 
 PREVIEW_WELCOME_COPY_VERSION = "en-v1"
@@ -251,6 +254,91 @@ def build_watermarked_photo(
     return output
 
 
+def _download_http_preview_source(url: str) -> bytes:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("La sorgente Preview non è un URL HTTP valido.")
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "BerryBotPreview/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > PREVIEW_SOURCE_MAX_BYTES:
+            raise ValueError("La foto sorgente supera il limite Preview di 20 MB.")
+        content = response.read(PREVIEW_SOURCE_MAX_BYTES + 1)
+    if len(content) > PREVIEW_SOURCE_MAX_BYTES:
+        raise ValueError("La foto sorgente supera il limite Preview di 20 MB.")
+    if not content:
+        raise ValueError("La sorgente Preview è vuota.")
+    return content
+
+
+def _is_protected_content_error(exc: TelegramError) -> bool:
+    return "protected content" in str(exc).lower()
+
+
+async def _recover_premium_message(
+    application,
+    premium_channel_id: str,
+    staging_chat_id: int | str,
+    message_id: int,
+):
+    temporary_message_ids: list[int] = []
+    try:
+        try:
+            recovered = await application.bot.forward_message(
+                chat_id=staging_chat_id,
+                from_chat_id=premium_channel_id,
+                message_id=message_id,
+                disable_notification=True,
+            )
+        except TelegramError as exc:
+            if not _is_protected_content_error(exc):
+                raise
+            copied = await application.bot.copy_message(
+                chat_id=staging_chat_id,
+                from_chat_id=premium_channel_id,
+                message_id=message_id,
+                disable_notification=True,
+                protect_content=False,
+            )
+            temporary_message_ids.append(copied.message_id)
+            recovered = await application.bot.forward_message(
+                chat_id=staging_chat_id,
+                from_chat_id=staging_chat_id,
+                message_id=copied.message_id,
+                disable_notification=True,
+            )
+        temporary_message_ids.append(recovered.message_id)
+        return recovered, temporary_message_ids
+    except Exception:
+        for temporary_id in reversed(temporary_message_ids):
+            try:
+                await application.bot.delete_message(
+                    chat_id=staging_chat_id,
+                    message_id=temporary_id,
+                )
+            except TelegramError:
+                LOGGER.warning("Could not clean up failed Preview recovery message", exc_info=True)
+        raise
+
+
+async def _delete_recovery_messages(
+    application,
+    staging_chat_id: int | str,
+    message_ids: list[int],
+) -> None:
+    for message_id in reversed(message_ids):
+        try:
+            await application.bot.delete_message(
+                chat_id=staging_chat_id,
+                message_id=message_id,
+            )
+        except TelegramError:
+            LOGGER.warning("Could not delete temporary Preview recovery message", exc_info=True)
+
+
 async def _download_preview_source(
     application,
     store: Store,
@@ -258,40 +346,39 @@ async def _download_preview_source(
     staging_chat_id: int | str | None = None,
 ) -> tuple[bytes, str]:
     file_id = item.file_id
-    forwarded_message = None
     try:
         telegram_file = await application.bot.get_file(file_id)
         content = bytes(await telegram_file.download_as_bytearray())
-    except TelegramError:
+    except TelegramError as original_error:
+        if urllib.parse.urlparse(file_id).scheme in {"http", "https"}:
+            try:
+                content = await asyncio.to_thread(_download_http_preview_source, file_id)
+                return content, file_id
+            except (OSError, ValueError):
+                LOGGER.warning("Direct Preview source download failed for media %s", item.id, exc_info=True)
         if not item.channel_message_id:
-            raise
+            raise original_error
         if staging_chat_id is None:
             admin_ids = sorted(store.get_admin_ids())
             staging_chat_id = admin_ids[0] if admin_ids else None
         premium_channel_id = store.get_setting("channel_id")
         if staging_chat_id is None or not premium_channel_id:
-            raise
-        forwarded_message = await application.bot.forward_message(
-            chat_id=staging_chat_id,
-            from_chat_id=premium_channel_id,
-            message_id=item.channel_message_id,
-            disable_notification=True,
+            raise original_error
+        recovered_message, temporary_ids = await _recover_premium_message(
+            application,
+            premium_channel_id,
+            staging_chat_id,
+            item.channel_message_id,
         )
         try:
-            if not forwarded_message.photo:
+            if not recovered_message.photo:
                 raise ValueError("Il messaggio Premium recuperato non contiene una foto.")
-            file_id = forwarded_message.photo[-1].file_id
+            file_id = recovered_message.photo[-1].file_id
             store.update_media_file_id(item.id, file_id)
             telegram_file = await application.bot.get_file(file_id)
             content = bytes(await telegram_file.download_as_bytearray())
         finally:
-            try:
-                await application.bot.delete_message(
-                    chat_id=staging_chat_id,
-                    message_id=forwarded_message.message_id,
-                )
-            except TelegramError:
-                LOGGER.warning("Could not delete temporary Preview recovery message", exc_info=True)
+            await _delete_recovery_messages(application, staging_chat_id, temporary_ids)
     return content, file_id
 
 async def _download_mosaic_source(
@@ -330,14 +417,14 @@ async def _download_mosaic_source(
     if staging_chat_id is None or not premium_channel_id:
         raise ValueError("Manca una chat admin per recuperare la thumbnail video Premium.")
 
-    forwarded_message = await application.bot.forward_message(
-        chat_id=staging_chat_id,
-        from_chat_id=premium_channel_id,
-        message_id=item.channel_message_id,
-        disable_notification=True,
+    recovered_message, temporary_ids = await _recover_premium_message(
+        application,
+        premium_channel_id,
+        staging_chat_id,
+        item.channel_message_id,
     )
     try:
-        video = getattr(forwarded_message, "video", None)
+        video = getattr(recovered_message, "video", None)
         thumbnail = getattr(video, "thumbnail", None)
         if thumbnail is None:
             raise ValueError("Il video Premium recuperato non contiene una thumbnail.")
@@ -346,13 +433,7 @@ async def _download_mosaic_source(
         telegram_file = await application.bot.get_file(thumbnail_file_id)
         return bytes(await telegram_file.download_as_bytearray())
     finally:
-        try:
-            await application.bot.delete_message(
-                chat_id=staging_chat_id,
-                message_id=forwarded_message.message_id,
-            )
-        except TelegramError:
-            LOGGER.warning("Could not delete temporary video-thumbnail message", exc_info=True)
+        await _delete_recovery_messages(application, staging_chat_id, temporary_ids)
 
 
 
@@ -552,39 +633,56 @@ class PreviewPublisher:
         timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
         start, end, _ = local_day_bounds(now, timezone_name)
         history = self.store.preview_history_between(start.isoformat(), end.isoformat())
-        item = self.selector.choose(
-            self.store.list_preview_candidates(now.isoformat()),
-            history,
-            self.store.latest_preview_item(),
-        )
-        if item is None:
-            return None
-        try:
-            photo = await prepare_preview_photo(
-                application,
-                self.store,
-                item,
-                staging_chat_id=staging_chat_id,
+        failed_ids: set[int] = set()
+        last_error: TelegramError | OSError | ValueError | None = None
+        while True:
+            candidates = [
+                item
+                for item in self.store.list_preview_candidates(now.isoformat())
+                if item.id not in failed_ids
+            ]
+            item = self.selector.choose(
+                candidates,
+                history,
+                self.store.latest_preview_item(),
             )
-            creator_credit = preview_creator_credit(item)
-            sent = await application.bot.send_photo(
-                chat_id=channel_id,
-                photo=photo,
-                disable_notification=False,
-                **({"caption": creator_credit} if creator_credit else {}),
+            if item is None:
+                if last_error is not None:
+                    raise last_error
+                return None
+            try:
+                photo = await prepare_preview_photo(
+                    application,
+                    self.store,
+                    item,
+                    staging_chat_id=staging_chat_id,
+                )
+                creator_credit = preview_creator_credit(item)
+                sent = await application.bot.send_photo(
+                    chat_id=channel_id,
+                    photo=photo,
+                    disable_notification=False,
+                    **({"caption": creator_credit} if creator_credit else {}),
+                )
+            except (TelegramError, OSError, ValueError) as exc:
+                self.store.mark_preview_failed(item.id, str(exc))
+                failed_ids.add(item.id)
+                last_error = exc
+                LOGGER.warning(
+                    "Manual Mouth Preview photo %s failed; trying another candidate",
+                    item.id,
+                    exc_info=True,
+                )
+                continue
+            published_at = now.isoformat(timespec="seconds")
+            self.store.mark_preview_published(
+                item.id,
+                sent.message_id,
+                published_at,
+                publish_source="manual",
             )
-        except (TelegramError, OSError, ValueError) as exc:
-            self.store.mark_preview_failed(item.id, str(exc))
-            raise
-        published_at = now.isoformat(timespec="seconds")
-        self.store.mark_preview_published(
-            item.id,
-            sent.message_id,
-            published_at,
-            publish_source="manual",
-        )
-        LOGGER.info("Manually published Mouth Preview photo %s", item.id)
-        return self.store.find_media_by_id(item.id) or item
+            LOGGER.info("Manually published Mouth Preview photo %s", item.id)
+            return self.store.find_media_by_id(item.id) or item
 
 
 @dataclass

@@ -111,6 +111,25 @@ class FakeRecoverBot(FakePreviewBot):
         self.deleted.append(kwargs)
 
 
+class FakeProtectedRecoverBot(FakeRecoverBot):
+    def __init__(self) -> None:
+        super().__init__()
+        self.copied: list[dict[str, object]] = []
+
+    async def forward_message(self, **kwargs):
+        self.forwarded.append(kwargs)
+        if kwargs["from_chat_id"] == "@premium":
+            raise TelegramError("Message has protected content and can't be forwarded")
+        return SimpleNamespace(
+            message_id=812,
+            photo=[SimpleNamespace(file_id="fresh-protected-file")],
+        )
+
+    async def copy_message(self, **kwargs):
+        self.copied.append(kwargs)
+        return SimpleNamespace(message_id=810)
+
+
 
 class FakeVideoRecoverBot(FakePreviewBot):
     def __init__(self) -> None:
@@ -534,6 +553,63 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.forwarded[0]["message_id"], 501)
         self.assertEqual(bot.deleted[0]["message_id"], 811)
 
+    async def test_protected_premium_message_is_copied_before_preview_recovery(self):
+        store = self.make_store()
+        store.set_setting("channel_id", "@premium")
+        item = self.add_published(store, 1)
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET channel_message_id = 501 WHERE id = ?",
+                (item.id,),
+            )
+        bot = FakeProtectedRecoverBot()
+
+        rendered = await prepare_preview_photo(
+            SimpleNamespace(bot=bot),
+            store,
+            store.find_media_by_id(item.id),
+            force_watermark=True,
+            staging_chat_id=99,
+        )
+
+        self.assertIsInstance(rendered, BytesIO)
+        self.assertEqual(store.find_media_by_id(item.id).file_id, "fresh-protected-file")
+        self.assertEqual(bot.forwarded[0]["from_chat_id"], "@premium")
+        self.assertEqual(bot.copied[0]["from_chat_id"], "@premium")
+        self.assertFalse(bot.copied[0]["protect_content"])
+        self.assertEqual(bot.forwarded[1]["from_chat_id"], 99)
+        self.assertEqual(bot.forwarded[1]["message_id"], 810)
+        self.assertEqual(
+            [call["message_id"] for call in bot.deleted],
+            [812, 810],
+        )
+
+    async def test_http_photo_url_is_downloaded_without_premium_forward(self):
+        store = self.make_store()
+        item = self.add_published(store, 1)
+        source_url = "https://example.test/photo.jpg"
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE media_items SET file_id = ? WHERE id = ?",
+                (source_url, item.id),
+            )
+        bot = FakePreviewBot()
+        bot.unavailable_file_ids.add(source_url)
+
+        with patch(
+            "telegram_channel_scheduler_bot.preview._download_http_preview_source",
+            return_value=bot.photo_content,
+        ) as download:
+            rendered = await prepare_preview_photo(
+                SimpleNamespace(bot=bot),
+                store,
+                store.find_media_by_id(item.id),
+                force_watermark=True,
+            )
+
+        self.assertIsInstance(rendered, BytesIO)
+        download.assert_called_once_with(source_url)
+
     async def test_manual_preview_button_path_publishes_one_eligible_photo(self):
         store = self.make_store()
         item = self.add_published(store, 1)
@@ -551,6 +627,23 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored.preview_published_at)
         self.assertEqual(stored.preview_publish_source, "manual")
         self.assertFalse(bot.photos[0]["disable_notification"])
+
+    async def test_manual_preview_skips_a_broken_candidate(self):
+        store = self.make_store()
+        broken = self.add_published(store, 1)
+        healthy = self.add_published(store, 2)
+        bot = FakePreviewBot()
+        bot.unavailable_file_ids.add(broken.file_id)
+
+        published = await PreviewPublisher(store).publish_one_now(
+            SimpleNamespace(bot=bot),
+            datetime(2026, 7, 13, 9, 0, tzinfo=UTC),
+            staging_chat_id=99,
+        )
+
+        self.assertEqual(published.id, healthy.id)
+        self.assertEqual(store.find_media_by_id(broken.id).preview_failed_attempts, 1)
+        self.assertEqual(len(bot.photos), 1)
 
     async def test_manual_preview_is_extra_and_does_not_consume_scheduled_slots(self):
         store = self.make_store()
