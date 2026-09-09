@@ -17,6 +17,7 @@ from .scheduling import (
     next_aligned_publish_after,
     next_allowed_datetime,
 )
+from .preview_selection import source_key as _source_key
 from .storage import Store
 
 
@@ -81,21 +82,9 @@ def _next_preview_day_slot(now: datetime, zone: ZoneInfo, posting_times: tuple[t
     return datetime.combine(tomorrow, posting_times[0], tzinfo=zone).astimezone(UTC)
 
 
-def _source_key(item) -> str:
-    if item.source_id:
-        return f"id:{item.source_id.strip().lower()}"
-    if item.source_label:
-        return f"label:{item.source_label.strip().lower()}"
-    if item.content_fingerprint:
-        pieces = item.content_fingerprint.split(":", 2)
-        if pieces:
-            return f"type:{pieces[0]}:{item.id}"
-    return f"item:{item.id}"
-
-
 def _selectable_candidate(eligible, history):
     used_sources = {_source_key(item) for item in history}
-    allowed = [item for item in eligible if _source_key(item) not in used_sources]
+    allowed = (item for item in eligible if _source_key(item) not in used_sources)
     return min(allowed, key=lambda item: (item.preview_failed_attempts, item.id), default=None)
 
 
