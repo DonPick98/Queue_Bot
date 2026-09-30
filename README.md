@@ -211,11 +211,13 @@ Mouth Preview e un flusso separato dal canale Premium:
 - usa foto gia pubblicate in Premium da almeno 48 ore;
 - evita di ripetere la stessa sorgente nello stesso giorno;
 - invia la prima foto con notifica normale e la seconda silenziosa;
-- pubblica le foto senza caption e applica un watermark semitrasparente in basso a sinistra;
+- pubblica le foto senza caption e applica un watermark diagonale semitrasparente, centrato e proporzionato al formato della foto;
 - mantiene silenziosi welcome e recap settimanale;
 - non crea conversion card dopo un numero fisso di anteprime;
 - crea ogni settimana un mosaico sfocato e oscurato con 9-12 thumbnail foto/video: invita all'acquisto senza mostrare chiaramente i contenuti;
-- usa i conteggi reali Premium e Preview; il test mostra subito l'avanzamento e non consuma il recap.
+- usa i conteggi settimanali Premium e Preview e i totali dell'archivio, separati in foto e video e aggiornati al momento dell'invio; il test mostra subito l'avanzamento e non consuma il recap.
+
+I totali dell'archivio contano i messaggi Premium registrati dal bot con un ID Telegram confermato. Gli aggiornamenti dello stesso messaggio non aumentano il totale; coda, invii falliti e marcature manuali senza un messaggio nel canale sono esclusi. Al primo avvio dopo l'aggiornamento, il bot recupera lo storico disponibile nel database. I post precedenti mai registrati e le cancellazioni effettuate direttamente in Telegram non possono essere ricostruiti automaticamente dal Bot API.
 
 Configurazione predefinita:
 

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from PIL import Image
+from PIL import Image, ImageFont
 from telegram.error import TelegramError
 
 from telegram_channel_scheduler_bot.preview import (
@@ -194,6 +194,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             result.media_item.file_unique_id,
             media_type,
             source="bot",
+            channel_message_id=2000 + index,
             media_item_id=result.media_item.id,
         )
         with store.connect() as connection:
@@ -212,15 +213,16 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
     def test_public_channel_copy_is_english(self):
         event = SimpleNamespace(preview_count=14, premium_count=84)
+        archive_counts = {"photo": 2345, "video": 678}
 
         self.assertIn("You'll get two hand-picked images", welcome_text())
         self.assertIn("does not publish videos", welcome_text())
-        copy = recap_text(event)
-        self.assertEqual(upgrade_text(event), copy)
-        self.assertIn("You've seen 14 previews this week", copy)
-        self.assertIn("Mouth Aesthethics published 84 posts (videos too!)", copy)
-        self.assertIn("first month for <b>$1</b>", copy)
-        self.assertIn("then <b>$3/month</b>", copy)
+        copy = recap_text(event, archive_counts)
+        self.assertEqual(upgrade_text(event, archive_counts), copy)
+        self.assertIn("You’ve seen 14 previews this week", copy)
+        self.assertIn("Mouth Aesthethics shared 84 posts—including videos you won’t see here.", copy)
+        self.assertIn("<b>$1 for your first month, then $3/month. Cancel anytime.</b>", copy)
+        self.assertIn("Already in the archive: <b>2,345 photos</b> and <b>678 videos</b>.", copy)
         self.assertNotIn("6 previews", copy)
 
     def test_due_slots_follow_project_timezone(self):
@@ -475,7 +477,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(primary[-1].id, items[-1].id)
 
 
-    def test_watermark_is_subtle_bottom_left_and_limits_working_size(self):
+    def test_watermark_is_translucent_and_limits_working_size(self):
         source = BytesIO()
         Image.new("RGB", (3000, 2000), (125, 125, 125)).save(source, format="JPEG")
 
@@ -494,8 +496,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(rendered.getpixel((950, 40))[0], 125, delta=8)
 
 
-    def test_watermark_stays_bottom_left_across_aspect_ratios(self):
-        for size in ((800, 1200), (1200, 800), (900, 900), (180, 1200)):
+    def test_watermark_spans_the_diagonal_without_clipping_across_aspect_ratios(self):
+        for size in ((800, 1200), (1200, 800), (900, 900), (180, 1200), (1200, 180)):
             with self.subTest(size=size):
                 source = BytesIO()
                 Image.new("RGB", size, (125, 125, 125)).save(source, format="JPEG")
@@ -504,10 +506,45 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
                 with Image.open(output) as rendered:
                     width, height = rendered.size
                     grayscale = rendered.convert("L")
-                    lower_left = grayscale.crop((0, int(height * 0.55), int(width * 0.72), height))
-                    self.assertLess(lower_left.getextrema()[0], 110)
-                    self.assertGreater(lower_left.getextrema()[1], 145)
-                    self.assertAlmostEqual(grayscale.getpixel((width - 20, 20)), 125, delta=8)
+                    mask = grayscale.point(lambda value: 255 if value < 112 or value > 145 else 0)
+                    bounds = mask.getbbox()
+                    self.assertIsNotNone(bounds)
+                    self.assertGreater(bounds[2] - bounds[0], width * 0.65)
+                    self.assertGreater(bounds[3] - bounds[1], height * 0.65)
+                    self.assertGreater(bounds[0], 0)
+                    self.assertGreater(bounds[1], 0)
+                    self.assertLess(bounds[2], width)
+                    self.assertLess(bounds[3], height)
+                    self.assertIsNotNone(mask.crop((0, height // 2, width // 2, height)).getbbox())
+                    self.assertIsNotNone(mask.crop((width // 2, 0, width, height // 2)).getbbox())
+                    self.assertAlmostEqual(grayscale.getpixel((20, 20)), 125, delta=8)
+
+    def test_watermark_remains_readable_and_translucent_on_light_and_dark_photos(self):
+        for background in (0, 255):
+            with self.subTest(background=background):
+                source = BytesIO()
+                Image.new("RGB", (900, 900), (background,) * 3).save(source, format="PNG")
+                with Image.open(build_watermarked_photo(source.getvalue())) as rendered:
+                    low, high = rendered.convert("L").getextrema()
+                    if background == 0:
+                        self.assertGreater(high, 40)
+                        self.assertLess(high, 100)
+                    else:
+                        self.assertLess(low, 220)
+                        self.assertGreater(low, 150)
+
+    def test_watermark_uses_oriented_dimensions_and_the_container_fallback_font(self):
+        source = BytesIO()
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.new("RGB", (1000, 600), (125, 125, 125)).save(source, format="JPEG", exif=exif)
+        with patch(
+            "telegram_channel_scheduler_bot.preview._watermark_font",
+            side_effect=lambda size: ImageFont.load_default(size=size),
+        ):
+            with Image.open(build_watermarked_photo(source.getvalue())) as rendered:
+                self.assertEqual(rendered.size, (600, 1000))
+                self.assertGreater(rendered.convert("L").getextrema()[1], 145)
 
     def test_watermark_scale_is_relative_to_image_resolution(self):
         heights: list[int] = []
@@ -710,6 +747,18 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         )
         bot = FakePreviewBot()
         app = SimpleNamespace(bot=bot)
+        WeeklyPreviewRecap(store).ensure_event(now=now, force=True)
+        original_get_file = bot.get_file
+        archive_grew = False
+
+        async def get_file_with_new_publication(file_id):
+            nonlocal archive_grew
+            if not archive_grew:
+                store.mark_published("new-video", "video", source="channel", channel_message_id=9000)
+                archive_grew = True
+            return await original_get_file(file_id)
+
+        bot.get_file = get_file_with_new_publication
 
         message, event = await WeeklyPreviewRecap(store).force_send(app, now=now)
         repeated_message, repeated_event = await WeeklyPreviewRecap(store).force_send(app, now=now)
@@ -717,8 +766,9 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(message)
         self.assertEqual(event.premium_count, 12)
         self.assertEqual(event.preview_count, 1)
-        self.assertIn("You've seen 1 preview this week", bot.photos[0]["caption"])
-        self.assertIn("Mouth Aesthethics published 12 posts", bot.photos[0]["caption"])
+        self.assertIn("You’ve seen 1 preview this week", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthethics shared 12 posts", bot.photos[0]["caption"])
+        self.assertIn("Already in the archive: <b>12 photos</b> and <b>1 video</b>.", bot.photos[0]["caption"])
         self.assertTrue(bot.photos[0]["disable_notification"])
         self.assertIsNone(repeated_message)
         self.assertEqual(repeated_event.event_key, event.event_key)

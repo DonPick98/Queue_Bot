@@ -6,6 +6,7 @@ from io import BytesIO
 import asyncio
 import hashlib
 import logging
+import math
 import re
 from typing import Iterable
 import urllib.parse
@@ -178,17 +179,35 @@ def welcome_text() -> str:
     )
 
 
-def upgrade_text(event: PreviewConversionEvent) -> str:
-    return recap_text(event)
+def upgrade_text(event: PreviewConversionEvent, archive_counts: dict[str, int] | None = None) -> str:
+    return recap_text(event, archive_counts)
 
 
-def recap_text(event: PreviewConversionEvent) -> str:
+def recap_text(event: PreviewConversionEvent, archive_counts: dict[str, int] | None = None) -> str:
     preview_label = "preview" if event.preview_count == 1 else "previews"
     post_label = "post" if event.premium_count == 1 else "posts"
+    archive_text = ""
+    if archive_counts is not None:
+        photos = archive_counts["photo"]
+        videos = archive_counts["video"]
+        photo_label = "photo" if photos == 1 else "photos"
+        video_label = "video" if videos == 1 else "videos"
+        archive_text = (
+            f"Already in the archive: <b>{photos:,} {photo_label}</b> and "
+            f"<b>{videos:,} {video_label}</b>.\n\n"
+        )
     return (
-        f"You've seen {event.preview_count} {preview_label} this week. During the same period, "
-        f"{PREMIUM_CHANNEL_NAME} published {event.premium_count} {post_label} (videos too!).\n\n"
-        "Try your first month for <b>$1</b>, then <b>$3/month</b> \u2193"
+        "🍓 A week of previews. A whole collection to discover.\n\n"
+        f"You’ve seen {event.preview_count} {preview_label} this week. "
+        f"{PREMIUM_CHANNEL_NAME} shared {event.premium_count} {post_label}"
+        "—including videos you won’t see here.\n\n"
+        f"{archive_text}"
+        "Like the selection? Explore the complete photo and video archive from day one, "
+        "without Preview watermarks.\n\n"
+        "Public photos disappear after a few months. The private archive stays available "
+        "throughout your membership… and keeps growing.\n\n"
+        "<b>$1 for your first month, then $3/month. Cancel anytime.</b>\n\n"
+        "Discover the full collection \u2193"
     )
 
 
@@ -223,30 +242,51 @@ def build_watermarked_photo(
 
     width, height = image.size
     scale_percent = max(3, min(18, int(scale_percent)))
-    font_size = max(8, round(min(width, height) * scale_percent / 100))
-    padding = max(8, round(min(width, height) * 0.025))
-    font = _watermark_font(font_size)
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
     label = text.strip() or "@MouthPreview"
-    bounds = draw.textbbox((0, 0), label, font=font)
-    while bounds[2] - bounds[0] > width - (2 * padding) and font_size > 8:
-        font_size = max(8, font_size - 2)
-        font = _watermark_font(font_size)
-        bounds = draw.textbbox((0, 0), label, font=font)
+    reference_bounds = _watermark_font(100).getbbox(label, stroke_width=2)
+    target_length = math.hypot(width, height) * 0.86 * scale_percent / 10
+    font_size = max(1, round(target_length * 100 / max(1, reference_bounds[2] - reference_bounds[0])))
+    font = _watermark_font(font_size)
+    stroke_width = max(1, round(font_size * 0.02))
+    bounds = font.getbbox(label, stroke_width=stroke_width)
+    lettering = Image.new(
+        "RGBA",
+        (max(1, bounds[2] - bounds[0] + 4), max(1, bounds[3] - bounds[1] + 4)),
+        (0, 0, 0, 0),
+    )
     alpha = max(24, min(160, int(opacity)))
-    shadow = max(20, min(110, alpha))
-    shadow_offset = max(1, round(font_size * 0.06))
-    x = padding - bounds[0]
-    y = max(padding - bounds[1], height - padding - shadow_offset - bounds[3])
-    draw.text(
-        (x + shadow_offset, y + shadow_offset),
+    ImageDraw.Draw(lettering).text(
+        (2 - bounds[0], 2 - bounds[1]),
         label,
         font=font,
-        fill=(0, 0, 0, shadow),
+        fill=(255, 255, 255, alpha),
+        stroke_width=stroke_width,
+        stroke_fill=(0, 0, 0, round(alpha * 0.85)),
     )
-    draw.text((x, y), label, font=font, fill=(255, 255, 255, alpha))
-    rendered = Image.alpha_composite(image, overlay).convert("RGB")
+
+    padding = max(1, round(min(width, height) * 0.04))
+    available_width = max(1, width - 2 * padding)
+    available_height = max(1, height - 2 * padding)
+    image_ratio = available_width / available_height
+    # Fit the rotated lettering to the image's aspect ratio, including its thickness.
+    angle = math.degrees(math.atan2(
+        max(0, lettering.width - image_ratio * lettering.height),
+        max(0, image_ratio * lettering.width - lettering.height),
+    ))
+    angle = max(1, min(89, angle))
+    radians = math.radians(angle)
+    rotated_width = lettering.width * math.cos(radians) + lettering.height * math.sin(radians)
+    rotated_height = lettering.width * math.sin(radians) + lettering.height * math.cos(radians)
+    fit = min(1.0, available_width / rotated_width, available_height / rotated_height)
+    if fit < 1:
+        lettering = lettering.resize(
+            (max(1, int(lettering.width * fit)), max(1, int(lettering.height * fit))),
+            Image.Resampling.LANCZOS,
+        )
+    lettering = lettering.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
+    lettering.thumbnail((available_width, available_height), Image.Resampling.LANCZOS)
+    image.alpha_composite(lettering, dest=((width - lettering.width) // 2, (height - lettering.height) // 2))
+    rendered = image.convert("RGB")
     output = BytesIO()
     output.name = "mouth-preview.jpg"
     rendered.save(output, format="JPEG", quality=90)
@@ -853,20 +893,22 @@ class WeeklyPreviewRecap:
             index for index, media_type in enumerate(media_types) if media_type == "video"
         ]
         mosaic = await asyncio.to_thread(build_mosaic, contents, 360, video_indices)
-        return await application.bot.send_photo(
-            chat_id=channel_id,
-            photo=mosaic,
-            caption=recap_text(event),
-            parse_mode="HTML",
-            reply_markup=upgrade_keyboard(
-                self.store.get_setting(
-                    "preview_memberpass_url",
-                    PREVIEW_MEMBERPASS_URL,
-                )
-                or PREVIEW_MEMBERPASS_URL
-            ),
-            disable_notification=True,
-        )
+        async with channel_publish_lock(application, "premium"):
+            archive_counts = self.store.premium_archive_counts_by_type()
+            return await application.bot.send_photo(
+                chat_id=channel_id,
+                photo=mosaic,
+                caption=recap_text(event, archive_counts),
+                parse_mode="HTML",
+                reply_markup=upgrade_keyboard(
+                    self.store.get_setting(
+                        "preview_memberpass_url",
+                        PREVIEW_MEMBERPASS_URL,
+                    )
+                    or PREVIEW_MEMBERPASS_URL
+                ),
+                disable_notification=True,
+            )
 
     async def send_test(
         self,

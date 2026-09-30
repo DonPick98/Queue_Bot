@@ -73,7 +73,7 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("dash:preview:opacity-down", callbacks)
         self.assertIn("dash:preview:opacity-up", callbacks)
         self.assertIn("Watermark: attivo", build_dashboard_text(store, "preview"))
-        self.assertIn("Dimensione: 10%", build_dashboard_text(store, "preview"))
+        self.assertIn("Watermark diagonale · scala: 10", build_dashboard_text(store, "preview"))
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks))
 
     def test_telegram_command_menu_contains_preview_tools(self):

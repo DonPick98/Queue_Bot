@@ -692,7 +692,7 @@ def build_dashboard_text(store: Store, view: str = "main") -> str:
                 "Feed: 2 immagini al giorno · ritardo 48h",
                 "Notifiche: prima normale · seconda silenziosa",
                 f"Watermark: {'attivo' if watermark else 'spento'} · {store.get_setting('preview_watermark_text', '@MouthPreview')}",
-                f"Dimensione: {store.get_int_setting('preview_watermark_scale_percent', 10)}% del lato corto",
+                f"Watermark diagonale · scala: {store.get_int_setting('preview_watermark_scale_percent', 10)}",
                 f"Opacità: {round(store.get_int_setting('preview_watermark_opacity', 64) / 255 * 100)}%",
                 f"Pinned: {'custom' if welcome_mode == 'custom' else 'default inglese'}",
                 "Conversione: solo recap settimanale",
@@ -983,7 +983,7 @@ async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         current = store.get_int_setting("preview_watermark_scale_percent", 10)
         updated = max(3, min(18, current + (-1 if data.endswith("down") else 1)))
         store.set_setting("preview_watermark_scale_percent", str(updated))
-        note = f"Dimensione watermark impostata al {updated}% del lato corto."
+        note = f"Scala watermark diagonale impostata a {updated}."
         view = "preview"
     elif data in {"dash:preview:opacity-down", "dash:preview:opacity-up"}:
         current = store.get_int_setting("preview_watermark_opacity", 64)

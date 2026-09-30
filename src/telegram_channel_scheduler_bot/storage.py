@@ -184,6 +184,12 @@ class Store:
                     channel_message_id INTEGER
                 );
 
+                CREATE TABLE IF NOT EXISTS premium_archive_posts (
+                    channel_message_id INTEGER PRIMARY KEY,
+                    media_type TEXT NOT NULL CHECK (media_type IN ('photo', 'video')),
+                    published_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS notification_day_plans (
                     local_date TEXT PRIMARY KEY,
                     planned_posts INTEGER NOT NULL,
@@ -253,6 +259,33 @@ class Store:
             self._ensure_column(connection, "published_media", "content_fingerprint TEXT")
             self._ensure_column(connection, "published_media", "content_hash TEXT")
             self._ensure_column(connection, "published_media", "visual_hash TEXT")
+            archive_version = connection.execute(
+                "SELECT value FROM settings WHERE key = 'premium_archive_counts_version'"
+            ).fetchone()
+            if archive_version is None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO premium_archive_posts
+                        (channel_message_id, media_type, published_at)
+                    SELECT channel_message_id, media_type, published_at
+                    FROM publish_log
+                    WHERE channel_message_id IS NOT NULL
+                    ORDER BY id DESC
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO premium_archive_posts
+                        (channel_message_id, media_type, published_at)
+                    SELECT channel_message_id, media_type, published_at
+                    FROM published_media
+                    WHERE channel_message_id IS NOT NULL
+                    ORDER BY published_at DESC
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO settings(key, value) VALUES('premium_archive_counts_version', 'v1')"
+                )
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_media_items_content_fingerprint
@@ -688,6 +721,15 @@ class Store:
         now = now_dt.isoformat(timespec="seconds")
         preview_eligible_at = (now_dt + timedelta(hours=self.get_int_setting("preview_delay_hours", 48))).isoformat(timespec="seconds")
         with self.connect() as connection:
+            if channel_message_id is not None:
+                connection.execute(
+                    """
+                    INSERT INTO premium_archive_posts(channel_message_id, media_type, published_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(channel_message_id) DO UPDATE SET media_type = excluded.media_type
+                    """,
+                    (channel_message_id, media_type, now),
+                )
             content_fingerprint = None
             content_hash = None
             visual_hash = None
@@ -1058,6 +1100,15 @@ class Store:
                 (start_at, end_at),
             ).fetchone()
         return int(row["count"] or 0)
+
+    def premium_archive_counts_by_type(self) -> dict[str, int]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT media_type, COUNT(*) AS count FROM premium_archive_posts GROUP BY media_type"
+            ).fetchall()
+        counts = {PHOTO: 0, VIDEO: 0}
+        counts.update({row["media_type"]: int(row["count"]) for row in rows})
+        return counts
 
     def preview_count_between(self, start_at: str, end_at: str) -> int:
         with self.connect() as connection:

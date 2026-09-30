@@ -92,6 +92,43 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(result.status, "already_published")
 
+    def test_archive_counts_only_confirmed_channel_posts_and_deduplicates_updates(self):
+        store = self.make_store()
+        store.add_media("photo", "queued-file", "queued-photo", None, 123)
+        failed = store.add_media("video", "failed-file", "failed-video", None, 123)
+        store.mark_failed(failed.media_item.id, "unavailable", max_attempts=1)
+        store.mark_published("marked-only", "photo", source="manual_mark")
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 0, "video": 0})
+
+        store.mark_published("photo", "photo", source="bot", channel_message_id=10)
+        store.mark_published("photo", "photo", source="channel", channel_message_id=10)
+        store.mark_published("video", "video", source="channel", channel_message_id=11)
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 1, "video": 1})
+
+        store.mark_published("photo", "photo", source="channel", channel_message_id=12)
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 2, "video": 1})
+
+    def test_archive_counts_replace_an_edited_post_instead_of_counting_it_twice(self):
+        store = self.make_store()
+        store.mark_published("old-photo", "photo", source="channel", channel_message_id=10)
+        store.mark_published("new-video", "video", source="channel", channel_message_id=10)
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 0, "video": 1})
+
+    def test_archive_migration_preserves_known_history_without_counting_manual_marks(self):
+        store = self.make_store()
+        store.mark_published("photo", "photo", source="bot", channel_message_id=10)
+        store.mark_published("video", "video", source="manual_mark")
+        store.mark_published("video", "video", source="channel", channel_message_id=11)
+        store.mark_published("marked-only", "photo", source="manual_mark")
+        with store.connect() as connection:
+            connection.execute("DROP TABLE premium_archive_posts")
+            connection.execute("DELETE FROM settings WHERE key = 'premium_archive_counts_version'")
+
+        store.initialize()
+        store.initialize()
+
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 1, "video": 1})
+
     def test_add_media_rejects_same_content_fingerprint(self):
         store = self.make_store()
         first = store.add_media("photo", "file-id-1", "unique-id-1", None, 123, "reddit:abc123")
