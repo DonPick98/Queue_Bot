@@ -2001,14 +2001,16 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if media is None:
         return
 
-    if update.channel_post:
+    if update.channel_post or update.edited_channel_post:
         if is_configured_channel(store, message):
-            store.mark_published(
-                media.file_unique_id,
-                media.media_type,
-                source="channel",
-                channel_message_id=message.message_id,
-            )
+            async with channel_publish_lock(context.application, "premium"):
+                store.mark_published(
+                    media.file_unique_id,
+                    media.media_type,
+                    source="channel",
+                    channel_message_id=message.message_id,
+                    published_at=message.date.astimezone(UTC).isoformat(timespec="seconds"),
+                )
             LOGGER.info("Tracked channel media %s from message %s", media.file_unique_id, message.message_id)
         return
 

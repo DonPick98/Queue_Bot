@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -263,26 +263,7 @@ class Store:
                 "SELECT value FROM settings WHERE key = 'premium_archive_counts_version'"
             ).fetchone()
             if archive_version is None:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO premium_archive_posts
-                        (channel_message_id, media_type, published_at)
-                    SELECT channel_message_id, media_type, published_at
-                    FROM publish_log
-                    WHERE channel_message_id IS NOT NULL
-                    ORDER BY id DESC
-                    """
-                )
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO premium_archive_posts
-                        (channel_message_id, media_type, published_at)
-                    SELECT channel_message_id, media_type, published_at
-                    FROM published_media
-                    WHERE channel_message_id IS NOT NULL
-                    ORDER BY published_at DESC
-                    """
-                )
+                self._backfill_premium_archive(connection)
                 connection.execute(
                     "INSERT INTO settings(key, value) VALUES('premium_archive_counts_version', 'v1')"
                 )
@@ -716,8 +697,9 @@ class Store:
         source: str,
         channel_message_id: int | None = None,
         media_item_id: int | None = None,
+        published_at: str | None = None,
     ) -> bool:
-        now_dt = datetime.now(UTC)
+        now_dt = datetime.fromisoformat(published_at).astimezone(UTC) if published_at else datetime.now(UTC)
         now = now_dt.isoformat(timespec="seconds")
         preview_eligible_at = (now_dt + timedelta(hours=self.get_int_setting("preview_delay_hours", 48))).isoformat(timespec="seconds")
         with self.connect() as connection:
@@ -1095,20 +1077,71 @@ class Store:
 
     def premium_count_between(self, start_at: str, end_at: str) -> int:
         with self.connect() as connection:
+            self._backfill_premium_archive(connection)
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM publish_log WHERE published_at >= ? AND published_at < ?",
+                "SELECT COUNT(*) AS count FROM premium_archive_posts WHERE published_at >= ? AND published_at < ?",
                 (start_at, end_at),
             ).fetchone()
         return int(row["count"] or 0)
 
     def premium_archive_counts_by_type(self) -> dict[str, int]:
         with self.connect() as connection:
+            self._backfill_premium_archive(connection)
             rows = connection.execute(
                 "SELECT media_type, COUNT(*) AS count FROM premium_archive_posts GROUP BY media_type"
             ).fetchall()
         counts = {PHOTO: 0, VIDEO: 0}
         counts.update({row["media_type"]: int(row["count"]) for row in rows})
         return counts
+
+    @staticmethod
+    def _backfill_premium_archive(connection: sqlite3.Connection) -> None:
+        # Recover confirmed posts written by legacy versions or restored history,
+        # preserving the newer ledger's classification of edited messages.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO premium_archive_posts(channel_message_id, media_type, published_at)
+            SELECT channel_message_id, media_type, published_at FROM publish_log
+            WHERE channel_message_id IS NOT NULL ORDER BY id DESC
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO premium_archive_posts(channel_message_id, media_type, published_at)
+            SELECT channel_message_id, media_type, published_at FROM published_media
+            WHERE channel_message_id IS NOT NULL ORDER BY published_at DESC
+            """
+        )
+
+    def refresh_preview_event_counts(
+        self, event: PreviewConversionEvent, end_at: str,
+    ) -> tuple[PreviewConversionEvent, dict[str, int]]:
+        with self.connect() as connection:
+            self._backfill_premium_archive(connection)
+            row = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM premium_archive_posts
+                     WHERE published_at >= ? AND published_at < ?) AS premium_count,
+                    (SELECT COUNT(*) FROM media_items
+                     WHERE preview_published_at >= ? AND preview_published_at < ?) AS preview_count,
+                    (SELECT COUNT(*) FROM premium_archive_posts WHERE media_type = 'photo') AS photo,
+                    (SELECT COUNT(*) FROM premium_archive_posts WHERE media_type = 'video') AS video
+                """,
+                (event.start_at, end_at, event.start_at, end_at),
+            ).fetchone()
+            refreshed = replace(
+                event, end_at=end_at, premium_count=int(row["premium_count"]),
+                preview_count=int(row["preview_count"]),
+            )
+            if event.id:
+                connection.execute(
+                    """UPDATE preview_conversion_events
+                       SET end_at = ?, premium_count = ?, preview_count = ?
+                       WHERE id = ? AND status = 'pending'""",
+                    (end_at, refreshed.premium_count, refreshed.preview_count, event.id),
+                )
+        return refreshed, {PHOTO: int(row["photo"]), VIDEO: int(row["video"])}
 
     def preview_count_between(self, start_at: str, end_at: str) -> int:
         with self.connect() as connection:

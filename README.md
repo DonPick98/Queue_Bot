@@ -215,9 +215,9 @@ Mouth Preview e un flusso separato dal canale Premium:
 - mantiene silenziosi welcome e recap settimanale;
 - non crea conversion card dopo un numero fisso di anteprime;
 - crea ogni settimana un mosaico sfocato e oscurato con 9-12 thumbnail foto/video: invita all'acquisto senza mostrare chiaramente i contenuti;
-- usa i conteggi settimanali Premium e Preview e i totali dell'archivio, separati in foto e video e aggiornati al momento dell'invio; il test mostra subito l'avanzamento e non consuma il recap.
+- ricalcola i conteggi settimanali Premium e Preview e i totali dell'archivio, separati in foto e video, subito prima di ogni invio e ritentativo; il test mostra subito l'avanzamento e non consuma il recap.
 
-I totali dell'archivio contano i messaggi Premium registrati dal bot con un ID Telegram confermato. Gli aggiornamenti dello stesso messaggio non aumentano il totale; coda, invii falliti e marcature manuali senza un messaggio nel canale sono esclusi. Al primo avvio dopo l'aggiornamento, il bot recupera lo storico disponibile nel database. I post precedenti mai registrati e le cancellazioni effettuate direttamente in Telegram non possono essere ricostruiti automaticamente dal Bot API.
+I totali dell'archivio contano i messaggi Premium registrati dal bot con un ID Telegram confermato. Gli aggiornamenti dello stesso messaggio non aumentano il totale; coda, invii falliti e marcature manuali senza un messaggio nel canale sono esclusi. A ogni conteggio, il bot riallinea il registro con lo storico disponibile nel database, anche se ripristinato o scritto da versioni precedenti, e riconosce le modifiche ai post del canale. Tutti i numeri del recap vengono letti dalla stessa istantanea del database dopo aver preparato il mosaico. Un ritentativo successivo mantiene il periodo originale per i conteggi settimanali e usa sempre i totali attuali dell'archivio. I post precedenti mai registrati e le cancellazioni effettuate direttamente in Telegram non possono essere ricostruiti automaticamente dal Bot API.
 
 Configurazione predefinita:
 

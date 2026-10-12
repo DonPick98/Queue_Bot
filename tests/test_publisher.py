@@ -1,12 +1,15 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from uuid import uuid4
 
+from telegram import Message, Update
 from telegram.error import TelegramError
 
 from telegram_channel_scheduler_bot.storage import FAILED, PUBLISHED, QUEUED, Store
 from telegram_channel_scheduler_bot.telegram_app import (
+    handle_media_message,
     publish_channel_manually,
     publish_many,
     publish_next,
@@ -42,6 +45,29 @@ class FakeBot:
 
 
 class PublisherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edited_channel_media_updates_totals_without_becoming_a_new_post(self):
+        store = self.make_store()
+        store.set_setting("channel_id", "-1001")
+        original_date = datetime(2026, 9, 1, 10, tzinfo=UTC)
+        store.mark_published(
+            "original-photo", "photo", source="channel", channel_message_id=10,
+            published_at=original_date.isoformat(),
+        )
+        message = Message.de_json({
+            "message_id": 10, "date": int(original_date.timestamp()),
+            "chat": {"id": -1001, "type": "channel", "title": "Premium"},
+            "video": {"file_id": "edited-file", "file_unique_id": "edited-video",
+                      "width": 640, "height": 480, "duration": 5},
+        }, None)
+        update = Update(update_id=1, edited_channel_post=message)
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"store": store}))
+
+        await handle_media_message(update, context)
+        await handle_media_message(update, context)
+
+        self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 0, "video": 1})
+        self.assertEqual(store.premium_count_between("2026-10-01", "2026-11-01"), 0)
+
     def make_store(self) -> Store:
         temp_root = Path(__file__).resolve().parents[1] / ".tmp"
         temp_root.mkdir(exist_ok=True)

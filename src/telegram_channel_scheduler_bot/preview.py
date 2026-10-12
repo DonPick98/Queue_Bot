@@ -837,6 +837,15 @@ class WeeklyPreviewRecap:
         event: PreviewConversionEvent,
         staging_chat_id: int | str | None = None,
     ):
+        message, _ = await self._send_event(application, event, staging_chat_id)
+        return message
+
+    async def _send_event(
+        self,
+        application,
+        event: PreviewConversionEvent,
+        staging_chat_id: int | str | None = None,
+    ):
         channel_id = self.store.get_setting("preview_channel_id")
         if not channel_id:
             raise ValueError("Configura prima il canale Mouth Preview.")
@@ -894,8 +903,15 @@ class WeeklyPreviewRecap:
         ]
         mosaic = await asyncio.to_thread(build_mosaic, contents, 360, video_indices)
         async with channel_publish_lock(application, "premium"):
-            archive_counts = self.store.premium_archive_counts_by_type()
-            return await application.bot.send_photo(
+            timezone_name = self.store.get_setting("timezone", "Europe/Rome") or "Europe/Rome"
+            period_end = (
+                datetime.fromisoformat(event.start_at).astimezone(ZoneInfo(timezone_name)) + timedelta(days=7)
+            ).astimezone(UTC)
+            # Recompute every number after preparing the mosaic and on every retry.
+            # A delayed recap keeps its original week; archive totals remain current.
+            end_at = min(utcnow(), period_end).isoformat()
+            event, archive_counts = self.store.refresh_preview_event_counts(event, end_at)
+            message = await application.bot.send_photo(
                 chat_id=channel_id,
                 photo=mosaic,
                 caption=recap_text(event, archive_counts),
@@ -909,6 +925,7 @@ class WeeklyPreviewRecap:
                 ),
                 disable_notification=True,
             )
+            return message, event
 
     async def send_test(
         self,
@@ -917,7 +934,7 @@ class WeeklyPreviewRecap:
         staging_chat_id: int | str | None = None,
     ):
         event = self.build_test_event(now)
-        message = await self.send_event(application, event, staging_chat_id=staging_chat_id)
+        message, event = await self._send_event(application, event, staging_chat_id=staging_chat_id)
         LOGGER.info("Published Mouth Preview weekly recap test without creating a weekly event")
         return message, event
 
@@ -927,7 +944,7 @@ class WeeklyPreviewRecap:
             return None, None
         if event.status == "sent":
             return None, event
-        message = await self.send_event(application, event)
+        message, event = await self._send_event(application, event)
         self.store.mark_preview_conversion_sent(event.id, message.message_id)
         LOGGER.info("Published forced Mouth Preview weekly recap %s", event.event_key)
         return message, event

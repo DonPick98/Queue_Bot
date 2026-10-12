@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -764,10 +764,10 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         repeated_message, repeated_event = await WeeklyPreviewRecap(store).force_send(app, now=now)
 
         self.assertIsNotNone(message)
-        self.assertEqual(event.premium_count, 12)
+        self.assertEqual(event.premium_count, 13)
         self.assertEqual(event.preview_count, 1)
         self.assertIn("You’ve seen 1 preview this week", bot.photos[0]["caption"])
-        self.assertIn("Mouth Aesthethics shared 12 posts", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthethics shared 13 posts", bot.photos[0]["caption"])
         self.assertIn("Already in the archive: <b>12 photos</b> and <b>1 video</b>.", bot.photos[0]["caption"])
         self.assertTrue(bot.photos[0]["disable_notification"])
         self.assertIsNone(repeated_message)
@@ -789,6 +789,85 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         weekly_event = recap.ensure_event(now=now, force=True)
         self.assertEqual(weekly_event.status, "pending")
         self.assertTrue(weekly_event.event_key.startswith("weekly:"))
+
+    async def test_each_recap_test_reads_the_current_photo_and_video_totals(self):
+        store = self.make_store()
+        items = [self.add_published(store, index) for index in range(1, 10)]
+        bot = FakePreviewBot()
+        recap = WeeklyPreviewRecap(store)
+        app = SimpleNamespace(bot=bot)
+        _, first = await recap.send_test(app)
+        self.add_published(store, 10)
+        self.add_published(store, 20, media_type="video")
+        store.mark_preview_published(items[0].id, 3001, datetime.now(UTC).isoformat())
+
+        _, second = await recap.send_test(app)
+
+        self.assertEqual((first.premium_count, second.premium_count), (9, 11))
+        self.assertEqual(second.preview_count, 1)
+        self.assertIn("<b>9 photos</b> and <b>0 videos</b>", bot.photos[0]["caption"])
+        self.assertIn("<b>10 photos</b> and <b>1 video</b>", bot.photos[1]["caption"])
+        self.assertEqual(store.pending_preview_conversion_events(datetime.now(UTC).isoformat()), [])
+
+    async def test_pending_recap_refreshes_all_counts_after_a_failed_send(self):
+        store = self.make_store()
+        items = [self.add_published(store, index) for index in range(1, 10)]
+        event = WeeklyPreviewRecap(store).ensure_event(force=True)
+        bot = FakePreviewBot()
+        original_send = bot.send_photo
+
+        async def fail_first_send(**kwargs):
+            message = await original_send(**kwargs)
+            if len(bot.photos) == 1:
+                raise TelegramError("temporary send failure")
+            return message
+
+        bot.send_photo = fail_first_send
+        scheduler = PreviewConversionScheduler(store)
+        app = SimpleNamespace(bot=bot)
+        self.assertEqual(await scheduler.send_pending(app), 0)
+        self.add_published(store, 20, media_type="video")
+        store.mark_preview_published(items[0].id, 3001, datetime.now(UTC).isoformat())
+
+        self.assertEqual(await scheduler.send_pending(app), 1)
+
+        self.assertIn("Mouth Aesthethics shared 9 posts", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthethics shared 10 posts", bot.photos[1]["caption"])
+        self.assertIn("You’ve seen 1 preview this week", bot.photos[1]["caption"])
+        self.assertIn("<b>9 photos</b> and <b>1 video</b>", bot.photos[1]["caption"])
+        with store.connect() as connection:
+            saved = connection.execute(
+                "SELECT premium_count, preview_count, status FROM preview_conversion_events WHERE id = ?",
+                (event.id,),
+            ).fetchone()
+        self.assertEqual(tuple(saved), (10, 1, "sent"))
+
+    async def test_late_recap_keeps_its_week_but_counts_the_current_archive(self):
+        store = self.make_store()
+        for index in range(1, 10):
+            self.add_published(store, index)
+        sunday = datetime(2026, 10, 11, 19, tzinfo=UTC)
+        monday = datetime(2026, 10, 12, 12, tzinfo=UTC)
+        with store.connect() as connection:
+            for table in ("media_items", "premium_archive_posts", "publish_log", "published_media"):
+                connection.execute(f"UPDATE {table} SET published_at = ?", ((sunday - timedelta(hours=1)).isoformat(),))
+        event = WeeklyPreviewRecap(store).ensure_event(now=sunday, force=True)
+        store.mark_published(
+            "monday-video", "video", source="channel", channel_message_id=9000,
+            published_at=monday.isoformat(),
+        )
+        bot = FakePreviewBot()
+        with patch("telegram_channel_scheduler_bot.preview.utcnow", return_value=monday):
+            sent = await PreviewConversionScheduler(store).send_pending(SimpleNamespace(bot=bot), now=monday)
+
+        self.assertEqual(sent, 1)
+        self.assertIn("Mouth Aesthethics shared 9 posts", bot.photos[0]["caption"])
+        self.assertIn("<b>9 photos</b> and <b>1 video</b>", bot.photos[0]["caption"])
+        with store.connect() as connection:
+            end_at = connection.execute(
+                "SELECT end_at FROM preview_conversion_events WHERE id = ?", (event.id,),
+            ).fetchone()["end_at"]
+        self.assertEqual(end_at, "2026-10-11T22:00:00+00:00")
 
     async def test_recap_skips_broken_telegram_files_and_still_builds_nine_tiles(self):
         store = self.make_store()
