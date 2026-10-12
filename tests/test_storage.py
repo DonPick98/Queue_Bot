@@ -114,6 +114,18 @@ class StoreTests(unittest.TestCase):
         store.mark_published("new-video", "video", source="channel", channel_message_id=10)
         self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 0, "video": 1})
 
+    def test_archive_counts_reconcile_legacy_posts_after_the_initial_migration(self):
+        store = self.make_store()
+        store.mark_published("photo", "photo", source="bot", channel_message_id=10)
+        store.mark_published("marked-only", "photo", source="manual_mark")
+        with store.connect() as connection:
+            connection.execute(
+                """INSERT INTO publish_log(file_unique_id, media_type, published_at, source, channel_message_id)
+                   VALUES('legacy-video', 'video', '2026-10-12T12:00:00+00:00', 'bot', 11)"""
+            )
+        for _ in range(2):
+            self.assertEqual(store.premium_archive_counts_by_type(), {"photo": 1, "video": 1})
+
     def test_archive_migration_preserves_known_history_without_counting_manual_marks(self):
         store = self.make_store()
         store.mark_published("photo", "photo", source="bot", channel_message_id=10)
