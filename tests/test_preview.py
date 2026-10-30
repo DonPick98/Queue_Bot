@@ -74,6 +74,7 @@ class FakeWelcomeBot:
         self.pins: list[dict[str, object]] = []
         self.deletions: list[dict[str, object]] = []
         self.edits: list[dict[str, object]] = []
+        self.text_edits: list[dict[str, object]] = []
 
     async def send_message(self, **kwargs):
         self.messages.append(kwargs)
@@ -87,6 +88,10 @@ class FakeWelcomeBot:
 
     async def edit_message_reply_markup(self, **kwargs):
         self.edits.append(kwargs)
+
+    async def edit_message_text(self, **kwargs):
+        self.text_edits.append(kwargs)
+        return SimpleNamespace(message_id=kwargs["message_id"])
 
 
 class FakeRecoverBot(FakePreviewBot):
@@ -215,13 +220,14 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(preview_count=14, premium_count=84)
         archive_counts = {"photo": 2345, "video": 678}
 
-        self.assertIn("You'll get two hand-picked images", welcome_text())
-        self.assertIn("does not publish videos", welcome_text())
+        self.assertIn("two selected photos a day", welcome_text())
+        self.assertIn("does not include videos", welcome_text())
         copy = recap_text(event, archive_counts)
         self.assertEqual(upgrade_text(event, archive_counts), copy)
         self.assertIn("You’ve seen 14 previews this week", copy)
-        self.assertIn("Mouth Aesthethics shared 84 posts—including videos you won’t see here.", copy)
-        self.assertIn("<b>$1 for your first month, then $3/month. Cancel anytime.</b>", copy)
+        self.assertIn("Mouth Aesthetics shared 84 posts—including videos you won’t see here.", copy)
+        self.assertIn("<b>First month: $1, one-time.</b> To continue", copy)
+        self.assertIn("<b>$3/month</b>", copy)
         self.assertIn("Already in the archive: <b>2,345 photos</b> and <b>678 videos</b>.", copy)
         self.assertNotIn("6 previews", copy)
 
@@ -230,7 +236,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 8, 0, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 1)
         self.assertEqual(due_preview_slots(datetime(2026, 7, 13, 18, 0, tzinfo=UTC), "Europe/Rome", "10:00,20:00"), 2)
 
-    async def test_english_welcome_replaces_previous_pinned_copy(self):
+    async def test_english_welcome_updates_previous_pinned_copy_in_place(self):
         store = self.make_store()
         store.set_setting("preview_welcome_message_id", "144")
         store.set_setting("preview_welcome_link_version", "v1")
@@ -238,17 +244,41 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         message = await ensure_preview_welcome(SimpleNamespace(bot=bot), store)
 
-        self.assertEqual(message.message_id, 2001)
-        self.assertIn("Welcome to Mouth Preview", bot.messages[0]["text"])
-        self.assertNotIn("Riceverai", bot.messages[0]["text"])
-        self.assertTrue(bot.messages[0]["disable_notification"])
-        self.assertEqual(bot.pins[0]["message_id"], 2001)
-        self.assertTrue(bot.pins[0]["disable_notification"])
-        self.assertEqual(bot.deletions[0]["message_id"], 144)
-        self.assertEqual(store.get_setting("preview_welcome_message_id"), "2001")
+        self.assertEqual(message.message_id, 144)
+        self.assertIn("Welcome to Mouth Preview", bot.text_edits[0]["text"])
+        self.assertEqual(bot.text_edits[0]["reply_markup"].inline_keyboard[0][0].text, "Explore Premium — $1")
+        self.assertEqual(bot.messages, [])
+        self.assertEqual(bot.pins, [])
+        self.assertEqual(bot.deletions, [])
+        self.assertEqual(store.get_setting("preview_welcome_message_id"), "144")
         stored_version = store.get_setting("preview_welcome_version")
         self.assertEqual(stored_version, preview_welcome_version(store))
         self.assertTrue(stored_version.startswith("en-v1:v1:default:"))
+
+    async def test_welcome_update_failure_preserves_previous_version(self):
+        store = self.make_store()
+        store.set_setting("preview_welcome_message_id", "144")
+        store.set_setting("preview_welcome_version", "old-version")
+        bot = FakeWelcomeBot()
+        bot.edit_message_text = AsyncMock(side_effect=TelegramError("message cannot be edited"))
+
+        with self.assertRaises(TelegramError):
+            await ensure_preview_welcome(SimpleNamespace(bot=bot), store)
+
+        self.assertEqual(store.get_setting("preview_welcome_version"), "old-version")
+        self.assertEqual(bot.messages, [])
+        self.assertEqual(bot.deletions, [])
+
+    async def test_welcome_unchanged_error_marks_current_version(self):
+        store = self.make_store()
+        store.set_setting("preview_welcome_message_id", "144")
+        store.set_setting("preview_welcome_version", "old-version")
+        bot = FakeWelcomeBot()
+        bot.edit_message_text = AsyncMock(side_effect=TelegramError("Message is not modified"))
+
+        await ensure_preview_welcome(SimpleNamespace(bot=bot), store)
+
+        self.assertEqual(store.get_setting("preview_welcome_version"), preview_welcome_version(store))
 
     async def test_memberpass_link_sync_updates_pinned_and_all_sent_recaps(self):
         store = self.make_store()
@@ -767,7 +797,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.premium_count, 13)
         self.assertEqual(event.preview_count, 1)
         self.assertIn("You’ve seen 1 preview this week", bot.photos[0]["caption"])
-        self.assertIn("Mouth Aesthethics shared 13 posts", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthetics shared 13 posts", bot.photos[0]["caption"])
         self.assertIn("Already in the archive: <b>12 photos</b> and <b>1 video</b>.", bot.photos[0]["caption"])
         self.assertTrue(bot.photos[0]["disable_notification"])
         self.assertIsNone(repeated_message)
@@ -831,8 +861,8 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await scheduler.send_pending(app), 1)
 
-        self.assertIn("Mouth Aesthethics shared 9 posts", bot.photos[0]["caption"])
-        self.assertIn("Mouth Aesthethics shared 10 posts", bot.photos[1]["caption"])
+        self.assertIn("Mouth Aesthetics shared 9 posts", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthetics shared 10 posts", bot.photos[1]["caption"])
         self.assertIn("You’ve seen 1 preview this week", bot.photos[1]["caption"])
         self.assertIn("<b>9 photos</b> and <b>1 video</b>", bot.photos[1]["caption"])
         with store.connect() as connection:
@@ -861,7 +891,7 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             sent = await PreviewConversionScheduler(store).send_pending(SimpleNamespace(bot=bot), now=monday)
 
         self.assertEqual(sent, 1)
-        self.assertIn("Mouth Aesthethics shared 9 posts", bot.photos[0]["caption"])
+        self.assertIn("Mouth Aesthetics shared 9 posts", bot.photos[0]["caption"])
         self.assertIn("<b>9 photos</b> and <b>1 video</b>", bot.photos[0]["caption"])
         with store.connect() as connection:
             end_at = connection.execute(
