@@ -37,7 +37,7 @@ PREVIEW_MOSAIC_CANDIDATE_LIMIT = 48
 PREVIEW_MOSAIC_DOWNLOAD_BATCH = 4
 PREVIEW_WATERMARK_MAX_DIMENSION = 2560
 PREVIEW_SOURCE_MAX_BYTES = 20 * 1024 * 1024
-PREMIUM_CHANNEL_NAME = "Mouth Aesthethics"
+PREMIUM_CHANNEL_NAME = "Mouth Aesthetics"
 
 PREVIEW_WELCOME_COPY_VERSION = "en-v1"
 REDDIT_CREATOR_CREDIT_RE = re.compile(r"u/[A-Za-z0-9_-]{3,20}")
@@ -165,17 +165,22 @@ class PreviewSelector:
 
 def upgrade_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"Try {PREMIUM_CHANNEL_NAME}", url=url)]]
+        [[InlineKeyboardButton("Explore Premium — $1", url=url)]]
     )
 
 
 def welcome_text() -> str:
     return (
         "🍓 <b>Welcome to Mouth Preview</b>\n\n"
-        "You'll get two hand-picked images every day, 48 hours after they appear in Premium.\n\n"
-        "Mouth Preview does not publish videos. Berry Premium gets the complete feed immediately: "
-        "12+ photos and videos every day.\n\n"
-        "First month: <b>$1</b>\nThen: <b>$3/month</b> · cancel anytime"
+        "Enjoy two selected photos a day. Preview does not include videos.\n\n"
+        "Want the full collection? Mouth Aesthetics gives you:\n\n"
+        "• The complete photo and video feed\n"
+        "• New posts as soon as they’re published\n"
+        "• Access to the growing archive\n"
+        "• No Preview watermarks\n\n"
+        "<b>First month: $1, one-time.</b>\n"
+        "Want to stay longer? Choose Monthly Access for <b>$3/month.</b>\n\n"
+        "👇 Explore the full collection"
     )
 
 
@@ -197,16 +202,15 @@ def recap_text(event: PreviewConversionEvent, archive_counts: dict[str, int] | N
             f"<b>{videos:,} {video_label}</b>.\n\n"
         )
     return (
-        "🍓 A week of previews. A whole collection to discover.\n\n"
+        "🍓 This week in Preview and Premium\n\n"
         f"You’ve seen {event.preview_count} {preview_label} this week. "
         f"{PREMIUM_CHANNEL_NAME} shared {event.premium_count} {post_label}"
         "—including videos you won’t see here.\n\n"
         f"{archive_text}"
-        "Like the selection? Explore the complete photo and video archive from day one, "
-        "without Preview watermarks.\n\n"
-        "Public photos disappear after a few months. The private archive stays available "
-        "throughout your membership… and keeps growing.\n\n"
-        "<b>$1 for your first month, then $3/month. Cancel anytime.</b>\n\n"
+        "Unlock the full photo and video feed, new posts as they’re published, "
+        "and the growing archive without Preview watermarks.\n\n"
+        "<b>First month: $1, one-time.</b> To continue, choose Monthly Access "
+        "for <b>$3/month</b>. Cancel the monthly plan anytime.\n\n"
         "Discover the full collection \u2193"
     )
 
@@ -989,14 +993,32 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
         store.get_setting("preview_welcome_version") == welcome_version
     ):
         return None
+    keyboard = upgrade_keyboard(
+        store.get_setting("preview_memberpass_url", PREVIEW_MEMBERPASS_URL)
+        or PREVIEW_MEMBERPASS_URL
+    )
+    if previous_message_id:
+        try:
+            message = await application.bot.edit_message_text(
+                chat_id=channel_id,
+                message_id=int(previous_message_id),
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=keyboard,
+            )
+        except TelegramError as exc:
+            if not _message_reply_markup_already_current(exc):
+                raise
+            message = None
+        store.set_setting("preview_welcome_version", welcome_version)
+        LOGGER.info("Updated Mouth Preview welcome in place")
+        return message
+
     message = await application.bot.send_message(
         chat_id=channel_id,
         text=text,
         parse_mode=parse_mode,
-        reply_markup=upgrade_keyboard(
-            store.get_setting("preview_memberpass_url", PREVIEW_MEMBERPASS_URL)
-            or PREVIEW_MEMBERPASS_URL
-        ),
+        reply_markup=keyboard,
         disable_notification=True,
     )
     await application.bot.pin_chat_message(
@@ -1006,17 +1028,6 @@ async def ensure_preview_welcome(application, store: Store, force: bool = False)
     )
     store.set_setting("preview_welcome_message_id", str(message.message_id))
     store.set_setting("preview_welcome_version", welcome_version)
-    if previous_message_id and previous_message_id != str(message.message_id):
-        try:
-            await application.bot.delete_message(
-                chat_id=channel_id,
-                message_id=int(previous_message_id),
-            )
-        except (TelegramError, ValueError):
-            LOGGER.warning(
-                "Could not remove the previous Mouth Preview welcome message",
-                exc_info=True,
-            )
     LOGGER.info("Published and pinned Mouth Preview welcome message")
     return message
 
