@@ -872,6 +872,36 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
         self.assertEqual(tuple(saved), (10, 1, "sent"))
 
+    async def test_recap_uses_live_channel_totals_instead_of_incomplete_ledger(self):
+        store = self.make_store()
+        for index in range(1,10):
+            self.add_published(store,index)
+        bot = FakePreviewBot()
+        app = SimpleNamespace(bot=bot)
+        with patch('telegram_channel_scheduler_bot.preview.live_archive_counts',
+                   new=AsyncMock(side_effect=[{'photo':1496,'video':516},{'photo':1497,'video':517}])) as reader:
+            recap = WeeklyPreviewRecap(store)
+            await recap.send_test(app)
+            await recap.send_test(app)
+        self.assertEqual(reader.await_count,2)
+        self.assertIn('<b>1,496 photos</b> and <b>516 videos</b>',bot.photos[0]['caption'])
+        self.assertIn('<b>1,497 photos</b> and <b>517 videos</b>',bot.photos[1]['caption'])
+
+    async def test_missing_live_counts_keeps_recap_pending_until_fresh_retry(self):
+        store = self.make_store()
+        for index in range(1,10):
+            self.add_published(store,index)
+        WeeklyPreviewRecap(store).ensure_event(force=True)
+        bot = FakePreviewBot()
+        app = SimpleNamespace(bot=bot)
+        with patch('telegram_channel_scheduler_bot.preview.live_archive_counts',
+                   new=AsyncMock(side_effect=[ValueError('Conteggi indisponibili'),{'photo':1496,'video':516}])):
+            scheduler = PreviewConversionScheduler(store)
+            self.assertEqual(await scheduler.send_pending(app),0)
+            self.assertEqual(bot.photos,[])
+            self.assertEqual(await scheduler.send_pending(app),1)
+        self.assertIn('<b>1,496 photos</b> and <b>516 videos</b>',bot.photos[0]['caption'])
+
     async def test_late_recap_keeps_its_week_but_counts_the_current_archive(self):
         store = self.make_store()
         for index in range(1, 10):
@@ -946,3 +976,4 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

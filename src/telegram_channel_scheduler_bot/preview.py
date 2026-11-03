@@ -26,6 +26,7 @@ from .preview_schedule import (
     parse_preview_times,
 )
 from .publish_lock import channel_publish_lock
+from .live_archive import live_archive_counts
 from .storage import MediaItem, PreviewConversionEvent, Store
 
 
@@ -915,6 +916,9 @@ class WeeklyPreviewRecap:
             # A delayed recap keeps its original week; archive totals remain current.
             end_at = min(utcnow(), period_end).isoformat()
             event, archive_counts = self.store.refresh_preview_event_counts(event, end_at)
+            live_counts = await live_archive_counts(self.store.get_setting('channel_id'))
+            if live_counts is not None:
+                archive_counts = live_counts
             message = await application.bot.send_photo(
                 chat_id=channel_id,
                 photo=mosaic,
@@ -1159,3 +1163,4 @@ def schedule_preview(application, store: Store) -> None:
         first=timedelta(seconds=15),
         name=PREVIEW_JOB_NAME,
     )
+

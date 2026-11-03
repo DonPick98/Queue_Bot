@@ -319,3 +319,19 @@ I test non chiamano Telegram:
 $env:PYTHONPATH="src"
 python -m unittest discover -s tests
 ```
+
+
+### Conteggi archivio del riepilogo
+
+Su Berry il riepilogo legge foto e video direttamente da Telegram subito prima
+dell’invio, tramite la sessione già collegata al servizio `x-publisher`.
+`PREVIEW_ARCHIVE_COUNTS_URL` e `PREVIEW_ARCHIVE_COUNTS_TOKEN_FILE` sono impostati
+dal compose di Berry. La risposta deve appartenere al canale Premium configurato,
+contenere due contatori esatti e avere meno di 30 secondi. Se la sessione non
+può leggere il canale, il servizio è offline o i dati non sono verificabili, il
+riepilogo resta pendente e riprova: non vengono usati vecchi totali come ripiego.
+Gli impianti standalone senza URL configurato continuano a usare il registro locale.
+Il controllo viene ripetuto per invii normali, test, invii forzati e ogni retry.
+Le pubblicazioni Premium del bot sono serializzate con il riepilogo; pubblicazioni
+manuali fatte su Telegram dopo la lettura possono naturalmente avvenire nei secondi
+necessari all’invio. Non vengono modificati i riepiloghi già pubblicati.
