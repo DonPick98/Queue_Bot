@@ -8,7 +8,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
+import re
 import threading
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -26,6 +28,7 @@ from .storage import Store
 
 LOGGER = logging.getLogger(__name__)
 PUBLIC_URL_SETTING = "last_public_base_url"
+DEFINITIVE_UPLOAD_REJECTIONS = {400, 401, 403, 404, 413, 415, 422, 429}
 MANUAL_PUBLISH_PATHS = {
     "/api/channels/premium/publish": "premium",
     "/api/channels/preview/publish": "preview",
@@ -120,6 +123,12 @@ def _multipart_body(fields: dict[str, str], file_field: str, filename: str, cont
     return b"".join(chunks), boundary
 
 
+class TelegramUploadRejected(RuntimeError):
+    def __init__(self, status: int):
+        self.status = status
+        super().__init__(f"Telegram rejected the upload (HTTP {status})")
+
+
 def _telegram_api(token: str, method: str, payload: bytes, boundary: str) -> dict[str, Any]:
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{urllib.parse.quote(token, safe=':')}/{method}",
@@ -131,10 +140,14 @@ def _telegram_api(token: str, method: str, payload: bytes, boundary: str) -> dic
         with urllib.request.urlopen(request, timeout=120) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Telegram API error {exc.code}: {details}") from exc
+        if exc.code in DEFINITIVE_UPLOAD_REJECTIONS:
+            raise TelegramUploadRejected(exc.code) from None
+        raise RuntimeError(f"Telegram upload outcome unknown (HTTP {exc.code})") from None
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
+        status = data.get("error_code")
+        if type(status) is int and status in DEFINITIVE_UPLOAD_REJECTIONS:
+            raise TelegramUploadRejected(status)
+        raise RuntimeError("Telegram upload outcome unknown")
     return data
 
 
@@ -182,8 +195,11 @@ class HealthHandler(BaseHTTPRequestHandler):
     }
 
     def do_GET(self) -> None:
-        remember_public_base_url(self.store, self.headers)
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/queue/capabilities":
+            _json_response(self, 200, {"upload_idempotency": True})
+            return
+        remember_public_base_url(self.store, self.headers)
         if parsed.path == "/api/channels/status":
             if self.store is None:
                 _json_response(self, 503, {"ok": False, "error": "queue_api_not_ready"})
@@ -284,6 +300,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         if cgi is None:
             return 500, {"ok": False, "error": "multipart_parser_unavailable"}
 
+        request_key = self.headers.get("Idempotency-Key", "").strip()
+        if request_key and not re.fullmatch(r"[A-Za-z0-9:_-]{16,128}", request_key):
+            return 400, {"ok": False, "error": "invalid_idempotency_key"}
+
         form = cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
@@ -334,17 +354,56 @@ class HealthHandler(BaseHTTPRequestHandler):
             if "caption_html" in form:
                 fields["parse_mode"] = "HTML"
 
-        file_field = "photo" if media_type == PHOTO else "video"
-        method = "sendPhoto" if media_type == PHOTO else "sendVideo"
-        body, boundary = _multipart_body(fields, file_field, upload.filename, content)
+        receipt = None
+        if request_key:
+            # The same logical item can be re-encoded while downloading on retry.
+            identity = media_type + ":" + (content_fingerprint or content_hash)
+            now = time.time()
+            reserved, previous = self.store.reserve_queue_upload(request_key, identity, now)
+            if not reserved:
+                if previous["identity"] != identity:
+                    return 409, {"ok": False, "error": "idempotency_key_conflict"}
+                if previous["result_json"]:
+                    return 200, json.loads(previous["result_json"])
+                if previous["receipt_json"]:
+                    receipt = json.loads(previous["receipt_json"])
+                elif now - previous["created_at"] < 180:
+                    return 503, {"ok": False, "error": "staging_in_progress"}
+                else:
+                    return 409, {"ok": False, "error": "staging_outcome_unknown"}
+            else:
+                try:
+                    existing = self.store.existing_queue_upload(media_type, content_fingerprint, content_hash)
+                except Exception:
+                    self.store.release_queue_upload(request_key)
+                    raise
+                if existing:
+                    item = existing.media_item
+                    return 200, self.store.finish_queue_upload(request_key, {
+                        "ok": True, "queue_status": existing.status, "media_type": media_type,
+                        "media_id": item.id if item else None,
+                        "available_after_publish_count": item.available_after_publish_count if item else None,
+                    })
 
-        try:
-            telegram_response = _telegram_api(self.bot_token, method, body, boundary)
-        except Exception as exc:
-            LOGGER.exception("Queue API upload failed")
-            return 502, {"ok": False, "error": str(exc)}
-
-        message = telegram_response["result"]
+        if receipt is None:
+            file_field = "photo" if media_type == PHOTO else "video"
+            method = "sendPhoto" if media_type == PHOTO else "sendVideo"
+            body, boundary = _multipart_body(fields, file_field, upload.filename, content)
+            try:
+                message = _telegram_api(self.bot_token, method, body, boundary)["result"]
+            except TelegramUploadRejected as exc:
+                if request_key:
+                    self.store.release_queue_upload(request_key)
+                status = exc.status if exc.status in {400, 413, 415, 422, 429} else 503
+                return status, {"ok": False, "error": "telegram_upload_rejected"}
+            except Exception:
+                LOGGER.warning("Telegram staging outcome could not be confirmed")
+                return 502, {"ok": False, "error": "staging_outcome_unconfirmed"}
+            receipt = {"message": message, "staging_chat_id": staging_chat_id}
+            if request_key:
+                self.store.record_queue_upload_receipt(request_key, receipt)
+        message = receipt["message"]
+        staging_chat_id = receipt["staging_chat_id"]
         if media_type == PHOTO:
             telegram_media = message["photo"][-1]
             video_width = None
@@ -377,10 +436,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             media_height=telegram_media.get("height"),
         )
 
-        if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:
-            _delete_staging_message(self.bot_token, staging_chat_id, message["message_id"])
-
-        return 200, {
+        result = {
             "ok": True,
             "queue_status": add_result.status,
             "media_id": add_result.media_item.id if add_result.media_item else None,
@@ -393,6 +449,11 @@ class HealthHandler(BaseHTTPRequestHandler):
             "staging_chat_id": staging_chat_id,
             "staging_message_id": message["message_id"],
         }
+        if request_key:
+            result = self.store.finish_queue_upload(request_key, result)
+        if os.getenv("QUEUE_API_DELETE_STAGING", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            _delete_staging_message(self.bot_token, staging_chat_id, message["message_id"])
+        return 200, result
 
     def log_message(self, format: str, *args: object) -> None:
         LOGGER.debug("Health endpoint: " + format, *args)

@@ -163,6 +163,14 @@ class Store:
                     notification_position INTEGER
                 );
 
+                CREATE TABLE IF NOT EXISTS queue_upload_requests (
+                    request_key TEXT PRIMARY KEY,
+                    identity TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    receipt_json TEXT,
+                    result_json TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS published_media (
                     file_unique_id TEXT PRIMARY KEY,
                     media_type TEXT NOT NULL CHECK (media_type IN ('photo', 'video')),
@@ -514,6 +522,43 @@ class Store:
 
     def add_admin_id(self, admin_id: int) -> None:
         self.ensure_admin_ids([admin_id])
+
+    def existing_queue_upload(self, media_type: str, fingerprint: str | None, content_hash: str) -> AddMediaResult | None:
+        fingerprint = normalize_fingerprint(fingerprint)
+        digest = normalize_hash(content_hash)
+        if self.is_published(media_type, "", fingerprint, digest):
+            return AddMediaResult(status="already_published")
+        with self.connect() as connection:
+            row = self._find_existing_media(connection, media_type, "", fingerprint, digest)
+            if row is None:
+                return None
+            item = self._row_to_media_item(row)
+            return AddMediaResult(status="duplicate", media_item=item, existing_status=item.status)
+
+    def reserve_queue_upload(self, key: str, identity: str, created_at: float) -> tuple[bool, dict]:
+        with self.connect() as connection:
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO queue_upload_requests(request_key,identity,created_at) VALUES(?,?,?)",
+                (key, identity, created_at),
+            ).rowcount
+            row = connection.execute("SELECT * FROM queue_upload_requests WHERE request_key=?", (key,)).fetchone()
+            return bool(inserted), dict(row)
+
+    def record_queue_upload_receipt(self, key: str, receipt: dict) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE queue_upload_requests SET receipt_json=? WHERE request_key=?",
+                               (json.dumps(receipt), key))
+
+    def finish_queue_upload(self, key: str, result: dict) -> dict:
+        with self.connect() as connection:
+            connection.execute("UPDATE queue_upload_requests SET result_json=? WHERE request_key=? AND result_json IS NULL",
+                               (json.dumps(result), key))
+            saved = connection.execute("SELECT result_json FROM queue_upload_requests WHERE request_key=?", (key,)).fetchone()
+            return json.loads(saved[0])
+
+    def release_queue_upload(self, key: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM queue_upload_requests WHERE request_key=? AND receipt_json IS NULL", (key,))
 
     def add_media(
         self,
