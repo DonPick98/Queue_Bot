@@ -36,6 +36,7 @@ from .health import (
     normalize_public_base_url,
     start_http_server_from_env,
 )
+from .media_quality import dimension_warning
 from .notifications import scheduled_posts_per_day
 from .posting_plan import (
     QUEUE_ALERT_HOURS,
@@ -708,7 +709,10 @@ def build_dashboard_text(store: Store, view: str = "main") -> str:
             lines.extend(["", "La coda è vuota."])
         else:
             lines.append("")
-            lines.extend(f"#{item.id} · {item.media_type} · {item.added_at}" for item in items)
+            for item in items:
+                lines.append(f"#{item.id} · {item.media_type} · {item.added_at}")
+                if item.quality_warning:
+                    lines.append(f"⚠ {item.quality_warning}")
         return "\n".join(lines)
     if view == "status":
         return "\n".join(
@@ -1154,6 +1158,8 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for item in items:
         caption = " con caption" if item.caption_html else ""
         lines.append(f"#{item.id} - {item.media_type}{caption} - aggiunto {item.added_at}")
+        if item.quality_warning:
+            lines.append(f"⚠ {item.quality_warning}")
     await update.effective_message.reply_text("\n".join(lines))
 
 
@@ -1979,7 +1985,9 @@ async def restore_help_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def format_add_result(result: AddMediaResult) -> str:
     if result.status == "queued" and result.media_item:
-        return f"Aggiunto in coda come #{result.media_item.id} ({result.media_item.media_type})."
+        item = result.media_item
+        message = f"Aggiunto in coda come #{item.id} ({item.media_type})."
+        return f"{message}\n⚠ {item.quality_warning}" if item.quality_warning else message
     if result.status == "already_published":
         return "Questo media risulta gia pubblicato sul canale, quindi non lo metto in coda."
     if result.status == "duplicate":
@@ -2033,6 +2041,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         video_duration=media.video_duration,
         media_width=media.media_width,
         media_height=media.media_height,
+        quality_warning=dimension_warning(media.media_type, media.media_width, media.media_height),
     )
     await message.reply_text(format_add_result(result))
     await check_queue_coverage_alert(context.application, notify=False)

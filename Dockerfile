@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata ffmpeg \
     && addgroup -S app \
     && adduser -S app -G app
 

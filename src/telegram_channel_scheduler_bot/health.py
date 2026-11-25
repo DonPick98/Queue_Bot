@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 
 from .balancer import PHOTO, VIDEO
 from .channel_status import build_channel_status
+from .media_quality import MediaQuality, has_queue_write_space, inspect_media
 from .storage import Store
 
 
@@ -304,6 +305,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         if request_key and not re.fullmatch(r"[A-Za-z0-9:_-]{16,128}", request_key):
             return 400, {"ok": False, "error": "invalid_idempotency_key"}
 
+        if not has_queue_write_space(self.store.path):
+            return 503, {"ok": False, "error": "Spazio insufficiente per accodare nuovi file. Riprovo più tardi."}
+
         form = cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
@@ -317,7 +321,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         if upload is None or not getattr(upload, "filename", None):
             return 400, {"ok": False, "error": "missing_media_file_field"}
 
-        content = upload.file.read()
+        with upload.file as uploaded_file:
+            content = uploaded_file.read()
         if not content:
             return 400, {"ok": False, "error": "empty_media"}
 
@@ -382,8 +387,17 @@ class HealthHandler(BaseHTTPRequestHandler):
                     return 200, self.store.finish_queue_upload(request_key, {
                         "ok": True, "queue_status": existing.status, "media_type": media_type,
                         "media_id": item.id if item else None,
+                        "quality_warning": item.quality_warning if item else None,
                         "available_after_publish_count": item.available_after_publish_count if item else None,
                     })
+
+        quality = inspect_media(media_type, content) if receipt is None else MediaQuality(**receipt.get("quality", {}))
+        if quality is None or quality.error:
+            if request_key:
+                self.store.release_queue_upload(request_key)
+            if quality is None:
+                return 503, {"ok": False, "error": "Verifica qualità occupata. Riprovo più tardi."}
+            return 422, {"ok": False, "error": quality.error}
 
         if receipt is None:
             file_field = "photo" if media_type == PHOTO else "video"
@@ -399,7 +413,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 LOGGER.warning("Telegram staging outcome could not be confirmed")
                 return 502, {"ok": False, "error": "staging_outcome_unconfirmed"}
-            receipt = {"message": message, "staging_chat_id": staging_chat_id}
+            receipt = {"message": message, "staging_chat_id": staging_chat_id, "quality": {
+                "warning": quality.warning, "photo_signature": quality.photo_signature,
+            }}
             if request_key:
                 self.store.record_queue_upload_receipt(request_key, receipt)
         message = receipt["message"]
@@ -434,6 +450,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             derived_tags=derived_tags,
             media_width=telegram_media.get("width"),
             media_height=telegram_media.get("height"),
+            photo_signature=quality.photo_signature,
+            quality_warning=quality.warning,
         )
 
         result = {
@@ -441,6 +459,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             "queue_status": add_result.status,
             "media_id": add_result.media_item.id if add_result.media_item else None,
             "media_type": media_type,
+            "quality_warning": add_result.media_item.quality_warning if add_result.media_item else None,
             "available_after_publish_count": (
                 add_result.media_item.available_after_publish_count
                 if add_result.media_item
