@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 from typing import Iterable, Iterator
@@ -16,6 +17,7 @@ from .config import (
     PREVIEW_MEMBERPASS_LINK_VERSION,
     PREVIEW_MEMBERPASS_URL,
 )
+from .media_quality import photo_distance
 from .notifications import MAX_AUDIBLE_POSTS_PER_DAY, audible_post_positions
 
 
@@ -24,6 +26,8 @@ PUBLISHED = "published"
 DUPLICATE = "duplicate"
 FAILED = "failed"
 REMOVED = "removed"
+PHOTO_SIGNATURE_RETENTION_DAYS = 90
+PHOTO_SIMILARITY_DISTANCE = 6
 
 
 def utcnow_iso() -> str:
@@ -71,6 +75,7 @@ class MediaItem:
     preview_notification_position: int | None = None
     preview_failed_attempts: int = 0
     preview_error: str | None = None
+    quality_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +244,13 @@ class Store:
             self._ensure_column(connection, "media_items", "content_fingerprint TEXT")
             self._ensure_column(connection, "media_items", "content_hash TEXT")
             self._ensure_column(connection, "media_items", "visual_hash TEXT")
+            self._ensure_column(connection, "media_items", "photo_signature TEXT")
+            self._ensure_column(connection, "media_items", "quality_warning TEXT")
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_media_items_photo_signature
+                ON media_items(status, published_at)
+                WHERE photo_signature IS NOT NULL
+            """)
             self._ensure_column(connection, "media_items", "priority INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "media_items", "available_after_publish_count INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "media_items", "video_width INTEGER")
@@ -551,8 +563,10 @@ class Store:
 
     def finish_queue_upload(self, key: str, result: dict) -> dict:
         with self.connect() as connection:
-            connection.execute("UPDATE queue_upload_requests SET result_json=? WHERE request_key=? AND result_json IS NULL",
-                               (json.dumps(result), key))
+            connection.execute("""
+                UPDATE queue_upload_requests SET result_json=?, receipt_json=NULL
+                WHERE request_key=? AND result_json IS NULL
+            """, (json.dumps(result), key))
             saved = connection.execute("SELECT result_json FROM queue_upload_requests WHERE request_key=?", (key,)).fetchone()
             return json.loads(saved[0])
 
@@ -580,7 +594,12 @@ class Store:
         derived_tags: Iterable[str] | str | None = None,
         media_width: int | None = None,
         media_height: int | None = None,
+        photo_signature: str | None = None,
+        quality_warning: str | None = None,
     ) -> AddMediaResult:
+        if media_type != PHOTO or not re.fullmatch(r"[a-f0-9]{32}", photo_signature or ""):
+            photo_signature = None
+        quality_warning = normalize_optional_text(quality_warning)
         content_fingerprint = normalize_fingerprint(content_fingerprint)
         content_hash = normalize_hash(content_hash)
         visual_hash = normalize_hash(visual_hash)
@@ -621,9 +640,10 @@ class Store:
                         media_type, file_id, file_unique_id, caption_html, added_by, added_at,
                         status, content_fingerprint, content_hash, visual_hash, priority,
                         available_after_publish_count, video_width, video_height, video_duration,
-                        source_id, source_label, derived_tags_json, media_width, media_height
+                        source_id, source_label, derived_tags_json, media_width, media_height,
+                        photo_signature, quality_warning
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         media_type,
@@ -646,6 +666,8 @@ class Store:
                         json.dumps(normalized_tags, ensure_ascii=False),
                         media_width,
                         media_height,
+                        photo_signature,
+                        quality_warning,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -664,11 +686,56 @@ class Store:
                     existing_status=item.status if item else None,
                 )
 
+            if photo_signature:
+                self._flag_similar_photo(
+                    connection, cursor.lastrowid, photo_signature, quality_warning, media_width, media_height,
+                )
+
             row = connection.execute(
                 "SELECT * FROM media_items WHERE id = ?",
                 (cursor.lastrowid,),
             ).fetchone()
             return AddMediaResult(status="queued", media_item=self._row_to_media_item(row))
+
+    @staticmethod
+    def _flag_similar_photo(
+        connection: sqlite3.Connection, media_id: int, signature: str, warning: str | None,
+        width: int | None, height: int | None,
+    ) -> None:
+        cutoff = (datetime.now(UTC) - timedelta(days=PHOTO_SIGNATURE_RETENTION_DAYS)).isoformat(timespec="seconds")
+        connection.execute("""
+            UPDATE media_items SET photo_signature = NULL
+            WHERE photo_signature IS NOT NULL AND status <> 'queued'
+              AND COALESCE(published_at, added_at) < ?
+        """, (cutoff,))
+        candidates = connection.execute("""
+            SELECT id, status, channel_message_id, photo_signature, media_width, media_height FROM media_items
+            WHERE photo_signature IS NOT NULL AND id <> ?
+              AND (status = 'queued' OR (status = 'published' AND published_at >= ?))
+        """, (media_id, cutoff))
+        matches = (
+            (distance, row["status"] != PUBLISHED, row["id"], row)
+            for row in candidates
+            if (distance := photo_distance(signature, row["photo_signature"])) <= PHOTO_SIMILARITY_DISTANCE
+        )
+        nearest = min(matches, default=None, key=lambda match: match[:3])
+        if nearest is None:
+            return
+        row = nearest[3]
+        if row["status"] == PUBLISHED:
+            reference = f"al post Telegram #{row['channel_message_id']}" if row["channel_message_id"] else f"alla foto pubblicata #{row['id']}"
+        else:
+            reference = f"alla foto #{row['id']} in coda"
+        suggestion = ""
+        if row["status"] == QUEUED and width and height and row["media_width"] and row["media_height"]:
+            previous_pixels = row["media_width"] * row["media_height"]
+            pixels = width * height
+            if pixels >= 1.5 * previous_pixels:
+                suggestion = f"Risoluzione maggiore nella foto #{media_id}."
+            elif previous_pixels >= 1.5 * pixels:
+                suggestion = f"Risoluzione maggiore nella foto #{row['id']}."
+        combined = " ".join(filter(None, (warning, f"Possibile doppione. Simile {reference}.", suggestion)))
+        connection.execute("UPDATE media_items SET quality_warning = ? WHERE id = ?", (combined, media_id))
 
     def _find_existing_media(
         self,
@@ -1592,6 +1659,7 @@ class Store:
             content_fingerprint=row["content_fingerprint"] if "content_fingerprint" in row.keys() else None,
             content_hash=row["content_hash"] if "content_hash" in row.keys() else None,
             visual_hash=row["visual_hash"] if "visual_hash" in row.keys() else None,
+            quality_warning=row["quality_warning"] if "quality_warning" in row.keys() else None,
             priority=int(row["priority"]) if "priority" in row.keys() else 0,
             available_after_publish_count=(
                 int(row["available_after_publish_count"])
